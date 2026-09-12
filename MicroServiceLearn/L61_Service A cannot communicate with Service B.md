@@ -1406,3 +1406,201 @@ Why TLS is needed	What it protects against
       TLS established? ❌
       │
       └── TLS/SSL Error
+
+
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+      DNS lookup is the process of converting a domain name like:
+
+         www.google.com → IP address like 142.x.x.x
+
+      Your browser needs the IP address to connect to the server.
+
+How DNS lookup happens
+
+Suppose you type:
+
+         https://www.example.com
+1. Browser cache
+
+The browser first checks:
+
+      "Do I already know the IP address for www.example.com?"
+
+      If yes → use it immediately.
+
+⬇️ If not...
+
+2. Operating System DNS cache
+
+         Your computer checks its local DNS cache.
+
+         For example, Windows may already have the DNS record cached.
+         
+         If found → return the IP.
+
+⬇️ If not...
+
+3. DNS Resolver
+
+Your computer sends the request to a DNS Resolver.
+
+Usually this could be:
+
+      Your ISP's DNS
+      Google DNS (8.8.8.8)
+      Cloudflare DNS (1.1.1.1)
+
+The resolver now tries to find the answer.
+
+⬇️
+
+4. Root DNS Server
+
+         The resolver asks a Root DNS Server:
+         
+         Where can I find information about .com?
+         
+         The root server doesn't know the IP of www.example.com.
+         
+         But it says:
+         
+         Ask the .com TLD server.
+
+⬇️
+
+5. TLD Server
+
+TLD = Top Level Domain.
+
+Examples:
+
+      .com
+      .org
+      .in
+
+The resolver asks the .com DNS server:
+
+      Where can I find example.com?
+      
+      The TLD server responds:
+      
+      Ask the Authoritative DNS server for example.com.
+
+⬇️
+
+6. Authoritative DNS Server
+
+         Now the resolver asks the authoritative DNS server:
+         
+         What is the IP address of www.example.com?
+         
+         It responds:
+         
+         www.example.com → 93.184.216.34
+
+⬇️
+
+7. Response comes back
+
+         The IP address travels back:
+         
+         Authoritative DNS
+         ↓
+         DNS Resolver
+         ↓
+         Your Computer
+         ↓
+         Browser
+
+The browser can now connect to:
+
+      93.184.216.34
+
+and start the actual HTTP/HTTPS connection.
+
+Complete flow
+         
+         User enters www.example.com
+         │
+         ▼
+         Browser Cache
+         │
+         ▼
+         OS DNS Cache
+         │
+         ▼
+         DNS Resolver
+         │
+         ▼
+         Root Server
+         │
+         ▼
+         .com TLD
+         │
+         ▼
+         Authoritative DNS
+         │
+         ▼
+         IP Address
+         │
+         ▼
+         Browser connects to Server
+
+
+
+
+
+
+| Command                  | What does it check?                          | Example                                  |
+| ------------------------ | -------------------------------------------- | ---------------------------------------- |
+| **`nslookup`**           | **DNS resolution**: hostname → IP            | `nslookup service-b.com`                 |
+| **`ping`**               | **Basic network reachability using ICMP**    | `ping 10.0.0.5`                          |
+| **`Test-NetConnection`** | **TCP connectivity to a specific IP + port** | `Test-NetConnection 10.0.0.5 -Port 8080` |
+
+
+
+| Feature                | `ping`                            | `Test-NetConnection`                     |
+| ---------------------- | --------------------------------- | ---------------------------------------- |
+| Tests                  | **ICMP connectivity**             | **TCP connectivity**                     |
+| Checks specific port?  | ❌ No                              | ✅ Yes                                    |
+| Example                | `ping 10.0.0.5`                   | `Test-NetConnection 10.0.0.5 -Port 8080` |
+| Useful for APIs?       | ⚠️ Limited                        | ✅ Very useful                            |
+| Can firewall block it? | Yes, ICMP can be blocked          | Yes, TCP can be blocked                  |
+| Success means          | Machine responds to ICMP          | TCP connection to that port succeeds     |
+| Failure means          | Could be down **or ICMP blocked** | Port/service/network path has a problem  |
+
+
+CONNECTION REFUSED
+
+| Cause                                  | Example                                       |
+| -------------------------------------- | --------------------------------------------- |
+| **Application is down**                | Spring Boot application stopped               |
+| **Wrong port**                         | Calling `8080`, app runs on `8081`            |
+| **Nothing listening on the port**      | No process bound to port                      |
+| **Wrong IP**                           | IP belongs to another reachable server        |
+| **Application bound to localhost**     | App only listens on `127.0.0.1`               |
+| **Container port configuration issue** | Wrong port mapping                            |
+| **Service configuration wrong**        | Calling incorrect target/port                 |
+| **Load Balancer listener missing**     | Connecting to a port where LB isn't listening |
+| **Service restarted/crashed**          | Application temporarily unavailable           |
+
+
+
+READ TIMEOUT :
+
+
+| Cause                     | Why response is slow?      |
+| ------------------------- | -------------------------- |
+| Slow application logic    | Code takes too long        |
+| Slow database query       | Query/index problem        |
+| External API slow         | Dependency takes time      |
+| High CPU                  | Requests process slowly    |
+| Thread pool exhausted     | Request waits for a thread |
+| Connection pool exhausted | Waiting for DB connection  |
+| High traffic              | Too many requests          |
+| Deadlock/contention       | Threads wait for resources |
+| GC pause                  | JVM temporarily pauses     |
+| Downstream service slow   | Dependency delays response |

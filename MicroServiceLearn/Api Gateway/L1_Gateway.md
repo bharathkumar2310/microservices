@@ -828,3 +828,21 @@ because it is a GlobalFilter.
       spring.cloud.gateway.routes[9].uri=http://localhost:8081
       spring.cloud.gateway.routes[9].predicates[0]=Path=/old-page
       spring.cloud.gateway.routes[9].filters[0]=RedirectTo=302, http://localhost:8081/new-page
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+SERVICE DISCOVERY :
+
+      Same as normal but include gateway also as a client of eureka server and register it with eureka server. 
+      Then in the gateway application.properties instead of using uri use serviceId to route to the service.
+
+      spring.cloud.gateway.routes[0].id=order-service
+      spring.cloud.gateway.routes[0].uri=lb://ORDER-SERVICE
+      spring.cloud.gateway.routes[0].predicates[0]=Path=/orders/**
+      
+      spring.cloud.gateway.routes[1].id=payment-service
+      spring.cloud.gateway.routes[1].uri=lb://PAYMENT-SERVICE
+      spring.cloud.gateway.routes[1].predicates[0]=Path=/payments/**

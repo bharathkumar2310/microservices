@@ -1141,3 +1141,255 @@ Production incident troubleshooting
     Service metrics are normal, but end-to-end latency is high.
     You fixed the immediate issue, but it keeps happening again. What do you do?
     How would you design your microservices so production issues are easier to debug?
+
+
+
+
+
+
+
+Microservices Scenario-Based Interview Questions
+1. Service-to-Service Communication
+   Service A cannot communicate with Service B. How do you troubleshoot?
+   Service B is intermittently unavailable. What could be happening?
+   Service A → Service B works sometimes but times out sometimes. Why?
+   You get Connection Refused. What does it mean?
+   What is the difference between Connection Timeout and Read Timeout?
+   Service B's health endpoint is UP, but actual requests are failing. Why?
+   Service A waits indefinitely for Service B. How do you handle it?
+   Service B becomes slow and causes Service A to become slow. What do you do?
+   Service B starts returning HTTP 500 errors. What should Service A do?
+   One downstream service is completely down. How do you prevent cascading failure?
+   How do you decide timeout values between services?
+   When should you use synchronous communication vs asynchronous communication?
+   How do you handle partial failure between microservices?
+2. API Gateway Scenarios
+   One service receives too many requests. How do you protect it?
+   A malicious user sends thousands of requests. What do you do?
+   How do you implement rate limiting?
+   Authentication should happen before requests reach services. Where do you implement it?
+   One API should be accessible only to admins. How do you handle it?
+   Gateway is becoming slow. How do you troubleshoot it?
+   Gateway is down. What happens to all services?
+   How do you avoid the API Gateway becoming a single point of failure?
+   Different clients need different responses from the same backend. How do you design this?
+   How do you route requests to different versions of a service?
+   How do you implement request logging in the Gateway?
+   How do you add correlation IDs at the Gateway?
+   A backend service is slow. Should the Gateway retry automatically?
+   How do you configure circuit breaking at the Gateway?
+3. Service Discovery & Load Balancing
+   A service registers with Eureka but other services cannot find it.
+   A service suddenly disappears from service discovery.
+   Eureka says a service is available, but requests fail.
+   Multiple instances of Service B are running. How does Service A choose one?
+   One instance is unhealthy but still receives traffic.
+   A new service instance starts. How does it start receiving traffic?
+   What happens when service discovery is temporarily unavailable?
+   How do you prevent requests from going to unhealthy instances?
+   Why might load balancing cause intermittent failures?
+4. Resilience & Cascading Failures
+   Service B is slow. Service A has 1000 waiting threads. What happens?
+   One dependency failure causes the entire system to fail. Why?
+   When should you use a Circuit Breaker?
+   Circuit Breaker opens frequently. What do you investigate?
+   What is the difference between Retry and Circuit Breaker?
+   When can retries make a problem worse?
+   What is a retry storm?
+   How do exponential backoff and jitter help?
+   When should you use Bulkhead?
+   How do you isolate failures between dependencies?
+   What fallback should you return when a dependency is unavailable?
+   Can fallback cause incorrect business behavior? Give an example.
+   How do you prevent thread pool exhaustion?
+   How would you design a resilient service calling 3 downstream services?
+5. Performance & Slow API Scenarios
+   An API that normally takes 100ms now takes 5 seconds. How do you troubleshoot?
+   P95 latency is high, but average latency looks normal. What does that indicate?
+   P99 latency suddenly increases. What do you check?
+   CPU usage is 95%. How do you investigate?
+   Memory usage continuously increases. What could be happening?
+   JVM heap is full. What do you check?
+   Garbage Collection is taking too long. What do you investigate?
+   Thread pool is exhausted. What happens?
+   Database connection pool is exhausted. What happens?
+   Traffic suddenly increases 10 times. How do you handle it?
+   Only one API endpoint is slow. How do you identify the cause?
+   All APIs are slow. What common components do you check?
+   API latency is high only during peak traffic. Why?
+   Requests are queued before processing. Where do you investigate?
+6. Observability & Production Debugging
+
+This is especially important for you because you are learning Actuator → Prometheus → Grafana → Tracing.
+
+Users report that the application is slow. What is your debugging approach?
+How do you identify which microservice is slow?
+How do distributed tracing help?
+How do you trace one request across 5 microservices?
+What is a correlation ID and why is it useful?
+Logs show errors, but metrics look normal. What do you do?
+Metrics show high latency, but CPU is normal. What do you check next?
+How do you identify whether the problem is application, database, or network?
+Which metrics do you check first during an incident?
+What is the difference between monitoring and observability?
+How do Prometheus and Grafana help in troubleshooting?
+What alerts would you configure for a production microservice?
+How do you investigate an increase in HTTP 500 errors?
+How do you investigate an increase in HTTP 429 errors?
+What would you check if error rate increases but traffic remains the same?
+7. Database Scenarios
+   The database becomes slow and all APIs are affected. How do you troubleshoot?
+   Database CPU is high. What could cause it?
+   One SQL query suddenly becomes slow. How do you investigate?
+   How do indexes improve performance?
+   Can too many indexes cause problems?
+   Database connection pool is exhausted. How do you debug it?
+   What is a connection leak?
+   How do you detect connection leaks?
+   Two users update the same record simultaneously. What happens?
+   How do you handle concurrency?
+   What is optimistic locking?
+   What is pessimistic locking?
+   A transaction is holding locks for too long. What happens?
+   Database deadlock occurs. How do you troubleshoot?
+   How do you handle database transaction failures?
+   Why should each microservice ideally own its database?
+8. Distributed Transactions & Saga
+   Order Service creates an order, but Payment Service fails. What happens?
+   Payment succeeds, but Inventory update fails. How do you handle it?
+   How does the Saga pattern solve distributed transaction problems?
+   What is a compensating transaction?
+   Choreography Saga vs Orchestration Saga?
+   What happens if the Saga orchestrator crashes?
+   How do you make Saga operations idempotent?
+   How do you recover incomplete Sagas?
+   Can compensating transactions completely undo everything?
+   How do you handle eventual consistency with users?
+9. Kafka / Messaging Scenarios
+   A Kafka consumer processes the same message twice. What do you do?
+   How do you make a consumer idempotent?
+   A producer sends a message, but you don't know whether Kafka received it. What do you do?
+   A consumer crashes while processing a message.
+   When should Kafka offsets be committed?
+   Consumer lag continuously increases. How do you troubleshoot?
+   One partition has huge traffic while others are idle. Why?
+   How do you handle uneven partition distribution?
+   A Kafka broker goes down. What happens?
+   The leader partition goes down. What happens?
+   What happens when all consumers in a consumer group are busy?
+   You have 10 consumers but only 3 partitions. What happens?
+   How do you retry failed Kafka messages?
+   What is a Dead Letter Topic?
+   A poison message keeps failing. How do you handle it?
+   How do you ensure message ordering?
+   Can Kafka guarantee exactly-once processing?
+   A consumer processes a message successfully but crashes before committing the offset.
+   Database update succeeds but Kafka event publishing fails. How do you solve this?
+
+👉 This last question leads to the Transactional Outbox Pattern, which is a very important interview topic.
+
+10. Deployment & Production Scenarios
+    A new deployment causes errors. What do you do?
+    How do you rollback a failed deployment?
+    How do you deploy without downtime?
+    What is Blue-Green Deployment?
+    What is Canary Deployment?
+    A new version is incompatible with the old version. How do you handle it?
+    How do you handle database schema changes during deployment?
+    What happens if half the service instances run old code and half run new code?
+    How do you safely deploy a breaking API change?
+    A deployment succeeds, but the application is unhealthy. What do you check?
+11. Kubernetes / Container Scenarios
+
+You can learn these later, but these are common in experienced interviews.
+
+Container keeps restarting. How do you troubleshoot?
+Pod is running but application is not accessible.
+Pod is in CrashLoopBackOff.
+Application works locally but not inside Docker.
+Environment variables are missing in production.
+Container is using too much memory.
+Pod is killed because of memory usage.
+How do readiness and liveness probes help?
+Service has multiple pods, but traffic doesn't reach some pods.
+How do you scale a microservice?
+How do you handle sudden traffic spikes?
+12. Security Scenarios
+    JWT token is valid but user should no longer have access. What do you do?
+    JWT token expires during a request.
+    How do you handle refresh tokens?
+    One microservice should communicate securely with another. How?
+    How do you prevent unauthorized service-to-service calls?
+    Sensitive data appears in logs. What do you do?
+    How do you secure internal APIs?
+    How do you rotate secrets without downtime?
+    API is vulnerable to brute-force login attempts. How do you protect it?
+13. Caching / Redis Scenarios
+    Cached data is stale. What do you do?
+    Database data changes but Redis still contains old data.
+    Redis goes down. What happens?
+    How do you prevent cache stampede?
+    Cache hit ratio suddenly decreases. What do you investigate?
+    When should you not use caching?
+    Two users receive inconsistent cached data. Why?
+14. Real Production Incident Questions
+
+These are extremely important because interviewers often ask them like this:
+
+Production is down. What is your first step?
+Users report intermittent failures. How do you investigate?
+Only some users are affected. What do you check?
+Errors happen only during peak hours.
+Everything works in lower environments but fails in production.
+CPU is normal, memory is normal, but the application is slow.
+Database is healthy, but APIs are slow.
+One microservice is healthy but the complete business flow fails.
+Error rate suddenly increases after deployment.
+Traffic increases but the system doesn't scale.
+One downstream dependency is causing failures everywhere.
+Logs are too large to manually search. How do you debug?
+You cannot reproduce the production issue locally. What do you do?
+The issue happens randomly once every few hours.
+⭐ The MOST IMPORTANT Questions to Practice First
+
+Don't try to answer all 175 at once.
+
+Start with these 30 questions:
+
+Service communication
+Service A cannot communicate with Service B.
+Intermittent failures.
+Connection refused vs timeout.
+Slow downstream service.
+Cascading failure.
+Gateway
+Too many requests.
+Rate limiting.
+Gateway slow.
+Authentication at Gateway.
+Resilience
+Circuit Breaker.
+Retry storm.
+Bulkhead.
+Timeout strategy.
+Performance
+API suddenly becomes slow.
+P95/P99 increases.
+High CPU.
+Memory leak.
+Thread pool exhaustion.
+Connection pool exhaustion.
+Observability
+How do you troubleshoot production issues?
+How do you identify the slow microservice?
+Metrics → logs → traces approach.
+Database
+Slow database.
+Slow query.
+Connection leak.
+Concurrent update/deadlock.
+Kafka
+Duplicate message.
+Consumer lag.
+Consumer failure.
+DB update succeeds but event publishing fails.
