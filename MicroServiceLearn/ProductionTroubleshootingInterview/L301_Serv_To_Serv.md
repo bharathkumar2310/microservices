@@ -1,3114 +1,3564 @@
-# Microservices Production Troubleshooting - Service-to-Service Connectivity
+# Service-to-Service Production Troubleshooting Through Fifteen Incidents
 
-## Purpose
+## How this continuous story works
 
-This document is a detailed interview and production troubleshooting guide for these 15 service-to-service communication questions:
-
-1. Service A is unable to connect to Service B.
-2. Service A receives `Connection refused`.
-3. Service A receives a connection timeout.
-4. Service A receives a read timeout.
-5. Requests work sometimes but time out intermittently.
-6. Service B is running, but Service A cannot reach it.
-7. Ping works, but the API call fails.
-8. DNS resolution for Service B fails.
-9. A hostname works from a laptop but not from Service A.
-10. An API gateway returns HTTP 502.
-11. An API gateway returns HTTP 503.
-12. An API gateway returns HTTP 504.
-13. Only one Service B instance is failing.
-14. Requests routed to one particular Service B instance fail.
-15. Service B's health endpoint is healthy, but its real APIs fail.
-
-The goal is not to memorize a list of commands. The goal is to learn how to identify the exact failing layer, collect evidence, narrow the fault domain, prove the root cause, apply the correct fix, and verify that the problem cannot immediately recur.
-
-> Command examples use placeholder names such as `service-b`, ports such as `8080`, and Kubernetes resources such as `<service-a-pod>`. Replace them with the real values. Run tests from the same runtime environment, network namespace, security identity, and proxy path as Service A whenever possible.
-
----
-
-# 1. Core Mental Model
-
-## 1.1 The complete request path
-
-When Service A calls Service B, the request normally passes through several independent stages:
+This guide follows one production engineer through fifteen incidents rather than presenting a theory manual.
+The running system is an online store.
+Order API, Service A, receives `POST /v1/orders` in Kubernetes.
+A calls an Envoy gateway or mesh, which selects Inventory API, Service B.
+B uses PostgreSQL, Redis, and Pricing Service C.
+Examples use UTC timestamps, request IDs, instances, versions, addresses, and safe redacted output.
+Metric names are examples: exact names and 502/503/504 semantics vary by stack and product.
 
 ```text
-Service A application code
-        |
-        | 1. Read configuration and build the URL
-        v
-DNS or service discovery
-        |
-        | 2. Resolve hostname to one or more IP addresses
-        v
-Routing, firewall, security group, network policy, NAT, proxy
-        |
-        | 3. Deliver packets to the destination network
-        v
-TCP listener on Service B host and port
-        |
-        | 4. Complete the TCP handshake
-        v
-TLS listener, when HTTPS or mTLS is used
-        |
-        | 5. Negotiate TLS and validate certificates
-        v
-Gateway, ingress, load balancer, sidecar, or reverse proxy
-        |
-        | 6. Select and forward to a backend
-        v
-Service B HTTP server
-        |
-        | 7. Match route, authenticate, authorize, and parse the request
-        v
-Service B business logic
-        |
-        | 8. Wait for threads, connection pools, CPU, and local resources
-        v
-Database, cache, queue, Kafka, external API, or Service C
-        |
-        | 9. Complete downstream work
-        v
-Serialize and return the response
+customer -> Order A -> A HTTP client/sidecar -> DNS -> TCP -> TLS
+         -> gateway/load balancer/mesh -> Inventory B -> DB/cache/Pricing C
+         -> reservation business outcome
 ```
 
-A failure at one stage does not prove that the later stages are broken. For example:
+## Terms I define before using them
 
-- A DNS error means TCP was never attempted.
-- A connection refusal means name resolution may have succeeded, but the destination did not accept the TCP connection.
-- A TLS error means TCP generally succeeded, but secure-session negotiation failed.
-- HTTP 401, 403, 404, or 500 means an HTTP responder was reached. Basic network connectivity therefore worked far enough to receive an HTTP response.
-- A read timeout means a connection was established, but the expected response did not arrive within the caller's deadline.
-- HTTP 502, 503, and 504 usually come from an intermediary, but the exact meaning depends on that product's configuration.
+A **counter** only increases until restart, such as `http_requests_total`; its rate over a window gives requests or errors per second.
+A **gauge** rises and falls, such as queue depth or healthy-target count.
+A **histogram** groups observations into buckets so duration distributions and percentiles can be estimated.
+The **p50** is the median; **p95** and **p99** expose the slowest 5% and 1%; **max** is the largest sample.
+Average can remain 120 ms while one percent wait five seconds, so I inspect p50/p95/p99/max and counts.
 
-## 1.2 Error classification table
+**RED** means Rate, Errors, Duration at each request boundary.
+**USE** means Utilization, Saturation, Errors for resources.
+Utilization is busy capacity; saturation means work waits; an error can be rejection, throttle, reset, or allocation failure.
+**Queueing** is waiting before work begins.
+**In-flight concurrency** is active work.
+Little's Law approximates `concurrency = throughput x time`: 200 requests/s at 0.1 s needs about 20 in flight, but at 5 s tends toward 1,000.
+That is why a flat request rate plus a slow dependency can exhaust threads and pools.
 
-| Symptom | What it normally proves | First fault domain to investigate |
-|---|---|---|
-| `UnknownHostException`, `Name or service not known`, `NXDOMAIN` | The requested hostname did not resolve | Hostname, DNS, service discovery, search domain |
-| DNS query timeout or `SERVFAIL` | A resolver did not answer successfully | Resolver health, DNS network path, authoritative DNS |
-| `No route to host` or `Network is unreachable` | The local networking stack could not find or use a route, or a device returned an unreachable response | Route table, subnet, gateway, network policy, firewall |
-| `Connection refused` | A TCP attempt reached something that actively rejected it | Listener, host, port, bind address, rejected target |
-| Connection timeout | TCP did not complete within the connect deadline | Packet drop, routing, firewall, security rule, unreachable target |
-| `Connection reset by peer` | A TCP connection existed and was forcefully closed | Service B, proxy, load balancer, TLS/protocol mismatch |
-| TLS handshake or certificate error | TCP normally succeeded; TLS negotiation or trust failed | Certificate, hostname/SAN, CA trust, SNI, TLS version, mTLS |
-| HTTP 400 | HTTP worked; the request was considered invalid | Request syntax, headers, payload, gateway validation |
-| HTTP 401 or 403 | HTTP worked; authentication or authorization failed | Token, identity, scope, role, clock, policy |
-| HTTP 404 | HTTP worked; the requested route or resource was not found | Path, base URL, route mapping, version, resource ID |
-| HTTP 429 | HTTP worked; a rate or concurrency limit rejected the request | Client rate, gateway quota, server throttling |
-| HTTP 500 | Service B or an intermediary executed code and failed | Application exception, dependency, data, configuration |
-| HTTP 502 | A gateway/proxy could not obtain or accept a valid upstream response | Gateway-to-backend connection, TLS, protocol, reset, malformed response |
-| HTTP 503 | The responder considered the service temporarily unavailable | No healthy backends, overload, maintenance, circuit breaker |
-| HTTP 504 | A gateway/proxy waited too long for an upstream response | Backend latency, queueing, dependencies, timeout budget |
-| Read timeout | The connection was established, but the client did not receive enough response data in time | Service queueing, slow processing, downstream delay, response transfer |
+A **correlation ID** joins logs for one request.
+A **trace** represents the distributed request; a **span** is one timed operation.
+A **parent span** invokes or contains a **child span**, such as a B server parent and DB-query child.
+Span status and attributes identify error, route, target, instance, version, zone, and retry.
+Tracing may be sampled, dropped, misconfigured, or absent across legacy hops.
+No B span directs me before B only after I corroborate sampling and access logs.
 
-These are starting points, not universal laws. Always identify which component generated the error and check that component's documented semantics.
+**DNS lookup duration** times name resolution.
+**TCP connect duration** normally times the SYN/SYN-ACK/ACK handshake.
+**TLS handshake duration** times secure negotiation and identity/trust validation.
+**Time to first byte** ends at the first response byte; **total duration** ends after the response body.
+Normal connect with slow first byte points after connection; normal first byte with slow total points to transfer or a slow consumer.
 
-## 1.3 Six rules that prevent random troubleshooting
+**Client metrics** describe the caller's observation; **server metrics** describe accepted work at the receiver.
+A attempts rising while B accepts stay flat means work stops between them, an intermediary rejects it, or telemetry is incomplete.
+A **retry attempt** is an extra try; retries can turn 200 user requests/s into 600 backend attempts/s.
+A **backend/target label** identifies the selected instance and exposes one-target faults.
 
-1. **Capture the exact error.** "Service B is down" is a conclusion, not evidence.
-2. **Test from Service A's execution environment.** A laptop, bastion, or unrelated debug pod may use different DNS, routes, policies, proxies, certificates, and identities.
-3. **Separate the hops.** Test `A -> gateway`, `gateway -> B`, and `B -> dependency` independently.
-4. **Change one variable at a time.** Otherwise, a successful retest does not prove which change fixed the issue.
-5. **Correlate across time and instance.** Record timestamp, request ID, source instance, destination instance, endpoint, status, and latency.
-6. **Prove recovery at the same layer that failed.** A healthy ping does not prove an HTTP fix, and a healthy `/health` response does not prove a business transaction works.
+For HTTP/DB pools, **active** is checked out, **idle** is reusable, and **pending** waits to acquire.
+Pool **acquisition** duration measures that wait.
+A full pool does not prove it is undersized: leaks and slow holders are common causes, and enlarging it can overload downstream.
+A **timeout** is a local wait limit.
+A **deadline** is the remaining end-to-end budget; it should decrease downstream and include all retries.
+More timeout does not make work faster.
 
-## 1.4 Evidence to collect before changing anything
+## Dashboard and universal layered metric map
 
-Record the following in an incident worksheet:
+I use a single time cursor with deployment/config/certificate/network/job annotations.
+The top row is orders attempted, reservations committed, and synthetic checkout.
+Then I follow A server RED, A client phase RED, gateway downstream/upstream RED, B server RED, B dependency RED, and USE for every resource.
+Every panel must split by route, status or exception, source, target, instance, zone, version, connection reuse, and retry attempt where applicable.
+
+| Layer and example metric family | What/where it measures | Why it changes and how I split it | What it proves, does not prove, and next evidence |
+|---|---|---|---|
+| Config: `config_revision_info`, `build_info` | loaded revision/version from process or deployment | rollout/reload/drift; instance/version/zone | reported state, not code-path use; compare effective runtime config with good peer |
+| DNS: `dns_lookup_duration_seconds`, `dns_queries_total{rcode}` | resolver latency, code, TTL, answers at A/DNS | slow forwarder, NXDOMAIN, SERVFAIL, stale answer; name/zone/resolver/source | resolver observation only; query from A and reconcile discovery |
+| TCP attempts/success/refusal/timeout | outbound socket outcomes at A/proxy | refusal is fast RST/no listener; timeout often drop; source/IP/port/zone | client socket outcome, not owning firewall; inspect listener/flow/route |
+| TCP handshake/retransmit/reset | connect time and transport quality at kernel/proxy | loss causes retransmission/tails; resets actively close; node/target/direction | transport symptom, not faulty device; compare nodes and flow telemetry |
+| TLS handshake/failure/cert expiry | negotiation, reason, identity at each TLS peer | SNI/SAN/CA/mTLS/protocol/cert rotation; SNI/target/issuer/version | secure-session result, not HTTP; inspect effective chain/trust/policy |
+| Gateway downstream status/duration | what gateway returned to A | policy or upstream result; route/generator/subreason/gateway | response at gateway; generator requires headers/log/product semantics |
+| Gateway upstream connect/response | gateway-to-B connect, first byte, result | connect issue before B; response delay in/after B; cluster/target | gateway hop only; compare direct path and trace |
+| Healthy/unhealthy targets and reasons | gateway/LB eligibility view | port/path/TLS/network/readiness/overload; target/zone/reason | configured probe only; compare listener and business contract |
+| Active/idle/new connections and age | connection reuse/churn in A/proxy | churn, pending pool, stale keep-alive; target/protocol/reuse | pool state, not root cause; inspect holders/draining/dependency |
+| Retry count and attempts/request | original/repeated attempts at client/proxy | retryable failure amplifies load; reason/attempt/target | amplification, not benefit; inspect deadline/downstream capacity |
+| Circuit breaker state/rejections | closed/open/half-open admission | thresholds reached after failures; destination/caller | policy action, not dependency cause; inspect trigger and settings |
+| A HTTP client RED and p50/p95/p99/max | caller request outcome and phase timing | demand/errors/tails; route/exception/target/source/version | A observation; compare gateway/B rate and trace |
+| Request/worker queue and in-flight | waiting/active work at proxy/service | arrivals exceed completions or service time rises; route/instance | local saturation, not why service slowed; inspect child work/Little's Law |
+| Thread active/max/queued/rejected | executor capacity and admission | active=max plus queue means saturation; pool/instance | executor pressure; more threads unsafe until blocked work/capacity known |
+| B HTTP server RED | accepted rate/status/duration/in-flight | handler outcome; route/status/source/instance/version | B accepted work, not internal owner; navigate child spans |
+| CPU/throttling | compute use/quota cap at container/node | load/code or quota; instance/node/version | low CPU can mean waiting; inspect queues/pools/dependencies |
+| Memory heap/RSS/OOM | managed and resident memory | leak/cache/payload/preload; instance/version | symptom; correlate allocation, config, GC and heap evidence |
+| GC pause/count | runtime collection cost | allocation/full heap causes pauses; instance/generation | long stop-the-world pause explains gaps; find heap cause |
+| Network bytes/errors/loss | traffic and interface quality | payload/load/loss/bad link; source/target/node/zone | correlation only; compare direction/devices/flow |
+| HTTP/DB pool active/idle/pending/acquire | checkout and wait inside A/B | leak/slow holder/pool exhaustion; pool/instance/dependency | wait boundary; inspect holder span and downstream capacity |
+| B dependency RED | DB/cache/C rate/error/latency | slow/error/retry; operation/fingerprint/target/B instance | child boundary; inspect dependency evidence |
+| DB query/pool/lock | execution, rows, waits, locks, connections | scan/index/lock/saturation; fingerprint/host | mechanism when trace-linked; read-only activity/plan evidence |
+| Business success | orders/reservations/synthetic outcome | technical or semantic failure; region/product/tenant | customer outcome, not layer; work backward by request ID |
+
+### Concrete metric-name examples
+
+The names below are examples only and vary by library, runtime, proxy, gateway, exporter, and monitoring backend.
+I verify the local metric definition, unit, histogram buckets, and label cardinality before writing a query or alert.
+
+| Question I ask | Example names I may find |
+|---|---|
+| How much user and backend traffic exists? | `http_server_requests_total`, `http_client_requests_total`, `envoy_cluster_upstream_rq_total` |
+| Which component generated each status? | `http_responses_total{generator,status}`, `envoy_http_downstream_rq_xx`, `nginx_ingress_controller_requests{status}` |
+| What succeeds, errors, or times out? | `http_client_requests_total{outcome}`, `http_client_timeouts_total{phase}`, `inventory_reservations_total{outcome}` |
+| What are p50/p95/p99/max? | `http_client_request_duration_seconds`, `http_server_request_duration_seconds`, `gateway_upstream_response_time_seconds` |
+| Is name resolution slow or failing? | `dns_lookup_duration_seconds`, `dns_queries_total{rcode}`, `coredns_dns_request_duration_seconds` |
+| Did TCP connect, refuse, or time out? | `tcp_connect_attempts_total`, `tcp_connect_success_total`, `tcp_connect_errors_total{reason}` |
+| Is transport lossy or resetting? | `node_netstat_Tcp_RetransSegs`, `tcp_resets_total`, `node_network_receive_errs_total` |
+| Did TLS negotiate and is expiry near? | `tls_handshake_duration_seconds`, `tls_handshake_failures_total{reason}`, `x509_cert_not_after` |
+| Where did gateway time go? | `gateway_upstream_connect_time_seconds`, `gateway_upstream_response_time_seconds`, `envoy_cluster_upstream_cx_connect_ms` |
+| Are targets eligible, and why not? | `healthy_target_count`, `unhealthy_target_count{reason}`, `probe_success{target}` |
+| Are connections reused or churning? | `http_pool_active_connections`, `http_pool_idle_connections`, `http_client_connections_created_total` |
+| Are retries amplifying demand? | `http_client_attempts_total{attempt}`, `http_client_retries_total{reason}`, `requests_per_original_request` |
+| Is a circuit breaker rejecting calls? | `circuit_breaker_state`, `circuit_breaker_rejected_total`, `envoy_cluster_upstream_rq_pending_overflow` |
+| Is work queueing? | `http_server_in_flight_requests`, `request_queue_depth`, `request_queue_wait_seconds` |
+| Is the worker executor saturated? | `executor_active_threads`, `executor_pool_size_threads`, `executor_queued_tasks`, `executor_rejected_tasks_total` |
+| Is CPU capped? | `container_cpu_usage_seconds_total`, `container_cpu_cfs_throttled_seconds_total` |
+| Is memory or GC pausing work? | `jvm_memory_used_bytes`, `process_resident_memory_bytes`, `jvm_gc_pause_seconds`, `dotnet_gc_pause_time_seconds` |
+| Is an HTTP pool saturated? | `http_pool_active`, `http_pool_idle`, `http_pool_pending`, `http_pool_acquire_duration_seconds` |
+| Is the DB pool saturated? | `db_pool_active`, `db_pool_idle`, `db_pool_pending`, `db_pool_acquire_duration_seconds` |
+| Is a B dependency slow? | `dependency_requests_total`, `dependency_request_duration_seconds`, `dependency_errors_total` |
+| Is the DB executing, scanning, or waiting? | `db_query_duration_seconds{fingerprint}`, `db_rows_examined_total`, `db_lock_wait_seconds`, `db_deadlocks_total` |
+| Did the business operation really complete? | `orders_completed_total`, `inventory_reservations_total`, `synthetic_checkout_success` |
+
+## Shape relationships I use
+
+If request rate rises first and B latency/errors rise after it, overload is possible because arrivals outpace completion.
+I next inspect in-flight, queue wait, thread active/max/queued/rejected, CPU/throttling, pool pending, and downstream capacity.
+If rate is flat but latency jumps at a rollout, service time, capacity, config, or dependency changed.
+If A latency rises while B server-span latency stays normal, time is before B, after B, or in A pool/retries.
+If B is slow and DB child is 4.7 s of 5.1 s, the DB path owns most observed latency.
+If no B span exists, investigate before B while checking tracing completeness.
+A flat B rate while A attempts rise is evidence of a pre-B loss/rejection, not a reason to inspect B's DB.
+Low CPU during high latency suggests waiting, not health.
+A spike pinned at exactly 3 or 5 seconds usually exposes a timeout boundary.
+A fleet average can hide one bad replica; one of eight failing targets predicts about 12.5% errors under even balancing.
+
+## Example trace waterfall and navigation
 
 ```text
-Caller:
-Caller instance/pod/host:
-Destination URL:
-Resolved destination IPs:
-Protocol and port:
-Proxy/gateway/load balancer path:
-Exact exception or HTTP status:
-Error message and nested/root exception:
-First failure time:
-Last failure time:
-Failure percentage:
-Affected endpoints/tenants/regions:
-Request ID or trace ID:
-Destination instance, if known:
-Client connect/read/overall timeouts:
-Recent deployment/config/network/certificate changes:
+A server total                                     5,120ms
+  A HTTP pool acquire                                 11ms
+  DNS                                                  2ms
+  TCP                                                   8ms
+  TLS                                                  14ms
+  gateway                                           5,040ms
+    upstream connect                                    7ms
+    B server                                         4,930ms
+      worker queue                                     52ms
+      DB pool acquire                                 111ms
+      DB query                                      4,702ms
+      serialize                                         6ms
 ```
 
-Do not paste credentials, bearer tokens, secrets, private keys, or sensitive payloads into notes or commands. Redact them from logs.
+I begin at A's root, follow parent to client child, gateway server/upstream child, B server child, and dependency children.
+I inspect status, exception event, route, target, instance, version, zone, attempt, reuse, and deadline.
+Small arithmetic mismatches can come from overlap, clocks, and instrumentation boundaries.
+I use the waterfall to choose logs/config/code/query evidence, not claim false precision.
 
-## 1.5 Baseline diagnostic commands
+## Production-safe command stories
 
-### Windows PowerShell
+I run bounded probes from A's real runtime or an approved equivalent; a laptop differs in DNS, route, identity, proxy, trust, and policy.
+I never use traffic floods, scans, destructive DB/Kubernetes commands, blind restarts, secrets, or unredacted payloads.
 
 ```powershell
-Resolve-DnsName service-b
-Test-NetConnection -ComputerName service-b -Port 8080 -InformationLevel Detailed
-curl.exe -v --connect-timeout 5 --max-time 15 http://service-b:8080/health
-Get-NetTCPConnection -LocalPort 8080 -State Listen
-netstat -ano | findstr :8080
+Resolve-DnsName inventory-b.internal -DnsOnly
+Test-NetConnection inventory-b.internal -Port 8443 -InformationLevel Detailed
+curl.exe --verbose --connect-timeout 3 --max-time 8 https://inventory-b.internal/health
 ```
 
-### Linux
+`Resolve-DnsName` shows A-host resolver answers/TTL: NXDOMAIN means absent in that view; SERVFAIL means resolution failed.
+`Test-NetConnection` proves one TCP handshake when true; false does not name the dropping device.
+`curl` separates connect/TLS/HTTP for one sample; a 401 proves an HTTP responder, not business success.
+Next I compare with metrics and a matched source/target.
 
 ```bash
-getent ahosts service-b
-dig service-b
-nc -vz -w 5 service-b 8080
-curl -v --connect-timeout 5 --max-time 15 http://service-b:8080/health
-ss -lntp
+getent ahosts inventory-b.internal
+dig +time=2 +tries=1 inventory-b.internal
+nc -vz -w 3 inventory-b.internal 8443
+curl -sS -v --connect-timeout 3 --max-time 8 -o /dev/null -w 'code=%{http_code} remote=%{remote_ip} connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' https://inventory-b.internal/health
+openssl s_client -connect 10.42.7.18:8443 -servername inventory-b.internal -verify_return_error -brief </dev/null
 ```
 
-### TLS
+`getent` follows application name-service configuration; `dig` exposes DNS details but may differ from runtime caching.
+`nc` tests one TCP port: fast refusal selects listener/target; bounded timeout selects route/drop/reachability.
+`curl` success example is `code=200 remote=10.42.7.18 connect=0.008 tls=0.021 ttfb=0.034 total=0.035`.
+`openssl` tests explicit SNI; output `Verification: OK` succeeds, while hostname/issuer/mTLS errors select TLS.
+Its trust store may differ from A's, so I inspect effective A trust next; disabling validation is never the fix.
 
 ```bash
-curl -v --connect-timeout 5 --max-time 15 https://service-b/health
-openssl s_client -connect service-b:443 -servername service-b -showcerts </dev/null
+kubectl get service -n shop inventory-b -o yaml
+kubectl get endpointslice -n shop -l kubernetes.io/service-name=inventory-b -o wide
+kubectl get pods -n shop -l app=inventory -o wide --show-labels
+kubectl describe pod -n shop <inventory-b-pod>
+kubectl get networkpolicy -n shop -o yaml
+kubectl exec -n shop <service-a-pod> -- getent hosts inventory-b
 ```
 
-`curl -k` disables certificate verification. It can be used once to prove that trust validation is the failing stage, but it is not a production fix. Correct the certificate, hostname, trust store, or mTLS configuration instead.
-
-### Kubernetes
+These read selectors, ports, endpoints, readiness/events, labels, and policies; `exec` tests A's container namespace when tools exist.
+A debug pod may have different labels, account, sidecar, DNS, or policy, so it is not automatically equivalent.
+`Running` does not prove ready, listening, selected, reachable, or business-capable.
 
 ```bash
-kubectl exec -n <namespace> <service-a-pod> -- getent hosts service-b
-kubectl exec -n <namespace> <service-a-pod> -- curl -v --connect-timeout 5 --max-time 15 http://service-b:8080/health
-kubectl get service -n <namespace> service-b -o yaml
-kubectl get endpointslice -n <namespace> -l kubernetes.io/service-name=service-b -o wide
-kubectl get pods -n <namespace> -l app=service-b -o wide
-kubectl describe pod -n <namespace> <service-b-pod>
-kubectl get networkpolicy -n <namespace>
+ss -lntp | grep ':8080'
 ```
 
-Minimal or distroless containers may not contain DNS or HTTP tools. An approved ephemeral debug container can help, but remember that a separate debug pod may have different labels, service account, sidecar, egress rules, or network policies. It is not automatically equivalent to Service A.
+On B, `0.0.0.0:8080` accepts non-loopback IPv4; `127.0.0.1:8080` is loopback only; no line means no listener in that namespace.
+I compare with sidecar namespaces and port mappings before concluding.
+
+```sql
+SELECT pid, wait_event_type, wait_event, state, query_start
+FROM pg_stat_activity
+WHERE datname = 'inventory'
+ORDER BY query_start;
+```
+
+This authorized read-only query can show a lock wait; it neither changes data nor links itself to a request.
+I use the trace fingerprint and timestamp to establish that link and avoid expensive unbounded diagnostics.
+
+## Incident discipline
+
+In minute one I record UTC, route, exact exception/status, latency, request/trace IDs, source, target, version, zone, timeout, and generator.
+By minute two I scope status/route/source/target/version/zone/tenant and new versus reused connection.
+By minute three I open business plus layered RED/USE and change annotations.
+By minute four I locate the last good boundary by adjacent rates and phase durations.
+By minute five I preserve one failure and one matched success before any drain/rollback destroys evidence.
+Mitigation reduces harm; root cause explains mechanism.
+I never propose larger timeout, retries, pool, threads, replicas, or restart without evidence and downstream-capacity analysis.
 
 ---
 
-# 2. Question 1 - Service A Is Unable to Connect to Service B
+# Incident 1: An Unknown Failure Becomes a TLS Diagnosis
 
 ## Interview question
 
 > Service A is unable to connect to Service B. How would you investigate?
 
-## What the statement does and does not tell you
+## The page arrives
 
-"Unable to connect" is too broad to diagnose. It can describe any failure from a malformed URL to a slow database. The first job is to replace that sentence with a precise observation:
+At 09:14 UTC on 2026-09-13, an unknown failure becomes a TLS diagnosis.
+The first failed request is `ord-7f93c2`, trace `01f92f3577b34da6a3ce929d0e0e0001`, from `order-a-4.18.2-k2m5q` toward `10.42.7.18:8443` and target label `inventory-b-r8x2p`.
+The measured scope is 42% of POST /v1/orders in eu-west-1; catalog and us-east-1 remain normal.
+The first metric sentence is: 220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
 
-```text
-Service A instance A-3 called https://service-b.example/orders at 14:32:08 UTC.
-DNS resolved 10.20.4.18.
-TCP connection to 10.20.4.18:443 succeeded in 12 ms.
-TLS failed because the certificate hostname did not match.
-```
+## What I do in the first five minutes
 
-That observation identifies a TLS problem. Without it, teams often check the database, restart pods, or change timeouts even though the request never reached Service B.
+### Minute 0-1: make the symptom exact
 
-## Where the problem can occur
+I write `09:14 UTC | request=ord-7f93c2 | source=order-a-4.18.2-k2m5q | target=10.42.7.18:8443 | scope=42% of POST /v1/orders in eu-west-1; catalog and us-east-1 remain normal`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
 
-| Fault domain | Example causes |
-|---|---|
-| Service A code/configuration | Wrong base URL, port, scheme, path, proxy, environment variable, stale configuration |
-| DNS/service discovery | Missing record, wrong namespace, stale IP, resolver failure, split-horizon DNS |
-| Network path | Missing route, firewall drop, security group, network ACL, Kubernetes NetworkPolicy, service-mesh egress rule |
-| TCP destination | Service down, wrong port, listener bound to localhost, full accept queue |
-| TLS/mTLS | Expired certificate, hostname mismatch, missing CA, SNI mismatch, client certificate rejected |
-| Gateway/load balancer | Wrong upstream, no healthy targets, protocol mismatch, stale target registration |
-| HTTP/API contract | Wrong route, method, headers, content type, authentication, API version |
-| Service B application | Startup failure, exception, overload, deadlock, resource exhaustion |
-| Service B dependency | Slow or unavailable DB, cache, Kafka, Service C, external provider |
-| One instance only | Version drift, bad secret, node issue, local resource exhaustion |
+### Minute 1-2: define the blast radius
 
-## Step-by-step debugging
+I split the dataset until I can state: 42% of POST /v1/orders in eu-west-1; catalog and us-east-1 remain normal.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
 
-### Step 1 - Establish the exact scope
+### Minute 2-3: open the exact dashboard
 
-Determine:
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `TLS between A's sidecar and B`, but it remains a hypothesis.
 
-- Is every request failing or only a percentage?
-- Is every Service A instance affected?
-- Is every Service B instance affected?
-- Is one endpoint, tenant, payload size, region, or protocol affected?
-- Did the issue begin immediately after a deployment, certificate rotation, DNS change, firewall change, or autoscaling event?
-- Is the call direct, or does it pass through a proxy, sidecar, gateway, ingress, or load balancer?
+### Minute 3-4: count across boundaries
 
-Scope is diagnostic evidence. A 25 percent failure rate across four equally weighted backends strongly suggests one bad backend. Failures only for large payloads suggest limits, serialization cost, or transfer time rather than basic reachability.
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
 
-### Step 2 - Read the complete client error
+### Minute 4-5: preserve evidence
 
-Inspect the root exception, not only the top-level wrapper. Many HTTP libraries wrap the useful cause:
+I save trace `01f92f3577b34da6a3ce929d0e0e0001`, sanitized logs for `ord-7f93c2`, target `inventory-b-r8x2p`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
 
-```text
-HTTP client exception
-  caused by retry exception
-    caused by SocketTimeoutException
-      caused by Connect timed out
-```
+## Metric-by-metric causal walk
 
-Record whether failure occurred during:
+### Business impact and A demand
 
-1. URL construction.
-2. DNS lookup.
-3. TCP connect.
-4. TLS handshake.
-5. Request write.
-6. Response wait/read.
-7. HTTP status handling.
-8. Response parsing.
+I begin with the user result. Order intake remains 220 requests/s, but successful reservations fall from 99.95% to 58% at 09:12:41. Because demand did not rise before the failure, an overload explanation has no support. The loss appears only on `POST /v1/orders` in `eu-west-1`, so I compare the changed A configuration there with the unchanged region.
 
-### Step 3 - Confirm the effective destination
+A's inbound rate and CPU remain steady, while its Inventory client changes from nearly all success to 92 TLS failures/s. There are no HTTP statuses on those failed attempts. An HTTP 4xx or 5xx would prove an HTTP responder was reached; a TLS exception says the exchange ended earlier.
 
-Verify the value Service A actually loaded at runtime:
+### DNS, TCP, and TLS phases
 
-```text
-scheme: https
-host: service-b.internal
-port: 443
-base path: /api/v2
-proxy: none or expected proxy
-```
+DNS for `inventory-v2.internal` remains p50 1 ms, p99 3 ms, with `NOERROR` and address `10.42.7.18`. If lookup latency or SERVFAIL had risen, I would stay with the resolver path. Here the answer is fast and stable, so I carry the selected IP into the TCP panel.
 
-Do not rely only on a configuration repository. A running process may have an old environment variable, mounted ConfigMap, secret, feature flag, or cached discovery result. Compare the effective configuration of a failing instance with a working instance. Redact secrets.
+TCP succeeds in 7 ms p95 with no refusal, timeout, retransmission, or reset increase. That rules out a missing listener and a dropped SYN for this failed dataset. If connect time had pinned at five seconds, I would inspect route and policy; if it had failed in 2 ms with refusal, I would inspect the listener.
 
-### Step 4 - Reproduce from Service A's runtime boundary
+The next phase changes sharply: `tls_handshake_failures_total{reason="hostname_mismatch",sni="inventory-v2.internal"}` rises from zero to 92/s. Successful handshakes using `inventory.internal` remain 14 ms p99. Certificate expiry is 41 days away, so expiry is not the issue; the reason label and SNI split point to identity selection.
 
-Execute a bounded diagnostic request from the Service A host, pod, container, or equivalent network namespace:
+### Gateway, target, and connection evidence
 
-```bash
-curl -v --connect-timeout 5 --max-time 15 https://service-b.internal/health
-```
+The sidecar records successful TCP connects but no upstream HTTP request for the failures. B's server request rate is flat rather than elevated, and no failed request ID appears in B access logs. That count boundary agrees with the missing B span: validation stopped before B's HTTP server.
 
-If the application uses a proxy, mTLS sidecar, custom trust store, or service identity, a plain shell `curl` may take a different path. Compare both tests and account for those differences.
+Target-health count stays at three because the probe uses the old SNI. A green probe therefore does not clear the client-specific TLS name. Active and idle connection counts remain normal; new connections fail only after revision `cfg-a-883`, while old pooled TLS sessions briefly continue to work. That transition explains the 42% rather than immediate 100% impact.
 
-### Step 5 - Test DNS independently
+Retries remain disabled for certificate validation errors, and the circuit breaker stays closed. Had retries risen, they would not repair deterministic identity mismatch and could amplify handshakes.
 
-```powershell
-Resolve-DnsName service-b.internal
-```
+### B runtime and dependencies
 
-```bash
-getent ahosts service-b.internal
-dig service-b.internal
-```
+B CPU is 34%, heap 57%, worker queue zero, DB pool pending zero, and DB/cache/Pricing C latency unchanged. Those normal values are expected because the failed calls never cross the TLS boundary. They are controls, not proof by themselves.
 
-Check:
+I now compare explicit SNI values from A's namespace. `openssl s_client` reports a hostname mismatch for `inventory-v2.internal` and `Verification: OK` for `inventory.internal`. The effective A config shows `cfg-a-883`, which changed only that destination name. That sequence links flat demand, successful DNS/TCP, failed TLS, absent B traffic, and the exact configuration change.
 
-- Did resolution succeed?
-- Did it return the expected IP type, region, environment, and number of addresses?
-- Does every Service A instance get the same answer?
-- Is an old IP still cached?
-- Does the application prefer an unreachable IPv6 address?
+## Trace: follow parent to the failing child
 
-### Step 6 - Test TCP independently
+I search trace `01f92f3577b34da6a3ce929d0e0e0001` and start at the A server parent.
+The failed waterfall reads `A server 63ms -> inventory client 18ms ERROR -> DNS 1ms -> TCP 7ms -> TLS 10ms ERROR; no B span`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-7f93c2`, `source=order-a-4.18.2-k2m5q`, `backend=inventory-b-r8x2p`, and `server.address=10.42.7.18:8443` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
 
-```powershell
-Test-NetConnection -ComputerName service-b.internal -Port 443 -InformationLevel Detailed
-```
+## Trace-selected logs
 
-```bash
-nc -vz -w 5 service-b.internal 443
-```
-
-Interpret the result:
-
-- Immediate refusal: destination was reached but rejected the port.
-- Timeout: handshake did not complete; investigate packet path and drops.
-- Success: DNS, routing, and TCP worked for this test. Continue to TLS or HTTP.
-
-### Step 7 - Test TLS, if applicable
-
-```bash
-openssl s_client -connect service-b.internal:443 -servername service-b.internal -showcerts </dev/null
-```
-
-Inspect:
-
-- Certificate validity dates.
-- Subject Alternative Name contains the requested hostname.
-- Issuer is trusted by Service A.
-- Full intermediate chain is supplied.
-- Client certificate is present and accepted for mTLS.
-- SNI selects the expected virtual host.
-- Client and server support a common TLS version and cipher.
-
-### Step 8 - Test HTTP behavior
-
-Use the real method, path, required headers, and a safe test payload when permitted:
-
-```bash
-curl -v --connect-timeout 5 --max-time 15 \
-  -H "Content-Type: application/json" \
-  https://service-b.internal/api/v2/orders
-```
-
-Interpret HTTP responses before returning to network checks:
-
-- 401/403: transport worked; investigate identity and authorization.
-- 404: transport worked; investigate route, path prefix, method, or version.
-- 415: content type or body format mismatch.
-- 429: throttling or quota.
-- 500: Service B or an intermediary executed the request and failed.
-- 502/503/504: identify the intermediary that generated it.
-
-### Step 9 - Inspect Service B
-
-Confirm:
-
-- Process/container/pod is running.
-- Application startup completed successfully.
-- The expected port is listening.
-- Listener is bound to a remotely reachable interface such as `0.0.0.0` or the correct host IP, not only `127.0.0.1`.
-- Readiness is true and the instance is registered in discovery.
-- Service B received the test request.
-- Logs, metrics, and traces show the same request ID and timestamp.
-
-### Step 10 - Inspect every intermediary
-
-For each gateway, load balancer, ingress, proxy, or service-mesh sidecar, verify:
-
-- Route match and upstream name.
-- Upstream DNS result.
-- Target IP and port.
-- Backend health and reason.
-- HTTP versus HTTPS protocol.
-- TLS SNI, trust, and client-certificate settings.
-- Connection, idle, and response timeout.
-- Retry and circuit-breaker state.
-- Request/response size limits.
-
-### Step 11 - Inspect Service B's dependencies
-
-If the request reached B but did not complete, trace:
+The trace selects the narrow log evidence `SSLPeerUnverifiedException: no SAN matching inventory-v2.internal`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
 
 ```text
-A -> B queue -> B code -> DB/cache/Kafka/C -> response serialization
+2026-09-13T09:14:22.417Z level=ERROR request_id=ord-7f93c2 trace_id=01f92f3577b34da6a3ce929d0e0e0001
+source_instance=order-a-4.18.2-k2m5q backend=inventory-b-r8x2p target=10.42.7.18:8443
+message="SSLPeerUnverifiedException: no SAN matching inventory-v2.internal"
 ```
 
-Check latency, errors, pool utilization, thread state, CPU throttling, memory pressure, GC pauses, locks, and downstream timeouts.
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
 
-### Step 12 - Correlate with changes
+## Safe config, runtime, network, and direct-path test
 
-Compare the first failure time with:
+The exact next test is to compare openssl handshakes with old/new SNI.
+I run one or a few bounded probes from A's real execution context and one matched control.
 
-- Service A or B deployment.
-- Configuration or secret rotation.
-- Certificate change.
-- DNS or service-discovery update.
-- Firewall, route, security group, or NetworkPolicy change.
-- Node replacement or autoscaling.
-- Database migration.
-- Traffic increase.
+```text
+FAIL request=ord-7f93c2 source=order-a-4.18.2-k2m5q target=10.42.7.18:8443
+RESULT new SNI hostname mismatch; old SNI Verification: OK
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
+```
 
-Correlation is a clue, not proof. Verify the mechanism before reverting or changing production.
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
 
-### Step 13 - Verify the fix
+### Result branches
 
-After the root cause is corrected:
+| Test result | Interpretation | Next evidence |
+|---|---|---|
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
 
-1. Repeat the same failing test from the same Service A environment.
-2. Test the real business endpoint, not only `/health`.
-3. Confirm normal success rate and latency across all instances.
-4. Confirm queues, retries, and resource saturation return to normal.
-5. Monitor for at least the relevant traffic cycle.
-6. Record evidence and add an alert, test, or configuration control that detects recurrence.
+## Alternate branches kept alive
+
+The symptom can have several causes; I reject each only with boundary evidence.
+
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
+
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
+
+## Fully worked causal chain
+
+1. At 09:14 UTC the triggering production state changed.
+2. A config revision cfg-a-883 changed SNI to inventory-v2.internal while B's certificate SAN contained only inventory.internal.
+3. Mechanically, wrong SNI caused identity validation to stop before HTTP.
+4. Therefore `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s`.
+5. Trace `01f92f3577b34da6a3ce929d0e0e0001` showed `A server 63ms -> inventory client 18ms ERROR -> DNS 1ms -> TCP 7ms -> TLS 10ms ERROR; no B span`.
+6. It selected log evidence `SSLPeerUnverifiedException: no SAN matching inventory-v2.internal`.
+7. The safe failed/control comparison showed `new SNI hostname mismatch; old SNI Verification: OK`.
+8. That explains the customer scope: 42% of POST /v1/orders in eu-west-1; catalog and us-east-1 remain normal.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
+
+## Mitigation is not root cause
+
+**Mitigation:** I roll back cfg-a-883 only.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
+
+**Root cause:** A config revision cfg-a-883 changed SNI to inventory-v2.internal while B's certificate SAN contained only inventory.internal.
+It lives at `TLS between A's sidecar and B` and explains why wrong SNI caused identity validation to stop before HTTP.
+A workaround that clears current state does not correct this mechanism.
+
+## Permanent correction
+
+The primary fix is to issue an overlapping certificate with the intended SAN and test SNI/trust pre-deploy.
+I apply only controls supported by the incident evidence:
+
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
+
+## Verification of recovery
+
+The incident-specific target is: success >99.9%, TLS failures 0, p99 <180ms for 30 minutes.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
+
+## Recurrence prevention
+
+I alert on business SLO plus `220/s demand is flat; success falls 99.95% to 58%; TLS failures jump to 92/s` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
 
 ## Interview-ready answer
 
-> I would first replace "cannot connect" with the exact exception, timestamp, affected scope, and request path. I would classify the failure as configuration, DNS, TCP, TLS, HTTP, application processing, or a downstream dependency. Then I would reproduce it from Service A's actual runtime environment, verify the effective host, port, scheme, path, and proxy, and test DNS, TCP, TLS, and HTTP separately. I would confirm that Service B is listening and ready, inspect every gateway or load balancer hop, correlate logs and traces by request ID and backend instance, and check B's dependencies if the request reached it. Finally, I would verify the correction with the original business request across all instances and add prevention rather than only restarting a service.
+> I would first turn "unable to connect" into a precise layer failure. At 09:14 UTC, order demand was steady at 220 requests per second, but reservation success fell to 58% and A reported 92 TLS hostname failures per second. DNS completed in 1 ms and TCP in 7 ms, while B received no matching HTTP requests. The failed trace ended at the TLS child span, and an explicit caller-context handshake failed only with the new SNI. I found that configuration revision `cfg-a-883` changed the name to `inventory-v2.internal`, which was absent from B's certificate. I rolled back that revision to mitigate impact, then issued the correctly scoped certificate and added SNI and trust validation to deployment tests. I verified zero TLS failures, success above 99.9%, normal p99 latency, and correct reservations for thirty minutes.
 
 ---
 
-# 3. Question 2 - Connection Refused
+# Incident 2: An Immediate Refusal Reveals a Bind Error
 
 ## Interview question
 
-> Service A is getting `Connection refused` while calling Service B. What could be the reasons, and how would you debug it?
+> Service A is getting "Connection Refused" while calling Service B. What could be the reasons?
 
-## What `Connection refused` means
+## The page arrives
 
-During a normal TCP handshake:
+At 10:02 UTC on 2026-09-13, an immediate refusal reveals a bind error.
+The first failed request is `ord-a61d09`, trace `02f92f3577b34da6a3ce929d0e0e0002`, from `order-a-4.18.2-v7n4j` toward `10.42.7.23:8080` and target label `inventory-b-3`.
+The measured scope is one third of reservations, only target B-3.
+The first metric sentence is: attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
+
+## What I do in the first five minutes
+
+### Minute 0-1: make the symptom exact
+
+I write `10:02 UTC | request=ord-a61d09 | source=order-a-4.18.2-v7n4j | target=10.42.7.23:8080 | scope=one third of reservations, only target B-3`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
+
+### Minute 1-2: define the blast radius
+
+I split the dataset until I can state: one third of reservations, only target B-3.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
+
+### Minute 2-3: open the exact dashboard
+
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `TCP listener on B-3`, but it remains a hypothesis.
+
+### Minute 3-4: count across boundaries
+
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
+
+### Minute 4-5: preserve evidence
+
+I save trace `02f92f3577b34da6a3ce929d0e0e0002`, sanitized logs for `ord-a61d09`, target `inventory-b-3`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
+
+## Metric-by-metric causal walk
+
+### Business impact and target probability
+
+Reservation failures begin at 10:02 UTC without a demand increase: A still receives 225 requests/s. The fleet error rate is about 33%, matching one of three evenly weighted B targets. Splitting by `backend` turns the aggregate into a clean result: B-1 and B-2 succeed, while B-3 fails every connection.
+
+A's client error is `Connection refused`, not timeout or HTTP failure. Connect duration for B-3 is 1-3 ms, and refusal count is 74/s. That fast, consistent response means a TCP RST returned; silent firewall drops normally consume the connect budget instead.
+
+### Resolve the selected destination, then inspect TCP
+
+DNS returns the expected three pod addresses in 2 ms p99, and the failed requests consistently select `10.42.7.23`. If answers had included a retired address, I would reconcile discovery. Here B-3 is a current endpoint, so I continue to its port.
+
+There are no SYN timeout or retransmission spikes. `tcp_connect_errors_total{reason="refused",target="10.42.7.23:8080"}` alone rises. TLS metrics have no samples because TCP never establishes, and gateway upstream connect failures map one-for-one to B-3. The gateway's target label is essential; without it the failure looks random.
+
+Target health is misleadingly green because the local probe reaches `127.0.0.1:8080`. New external connections to the pod IP fail; idle pooled connections to the other targets remain healthy. If all targets refused, I would suspect a shared port or deployment. The one-target split sends me to B-3's network namespace.
+
+### Listener, server, and resource comparison
+
+B-3 has zero HTTP server requests for failed IDs, while peers each receive about 75/s. Its CPU, heap, GC, worker queue, and DB pool are normal because rejected connections never execute application work. Dependency traffic from B-3 is also zero. Increasing workers, pools, or replicas would not make a socket listen on the pod interface.
+
+A safe `ss -lntp` comparison shows B-3 listening at `127.0.0.1:8080`, while B-2 listens at `0.0.0.0:8080`. The runtime environment then shows `SERVER_ADDRESS=127.0.0.1` only on B-3 and config hash `legacy-71c`. A local curl succeeds and a pod-IP curl refuses, exactly as that bind predicts.
+
+The alternate fast-refusal branches are a process crash, wrong target port, exhausted accept path, or a rejecting sidecar. Process uptime is continuous, the port mapping matches peers, and the listener output directly selects the bind-address branch.
+
+## Trace: follow parent to the failing child
+
+I search trace `02f92f3577b34da6a3ce929d0e0e0002` and start at the A server parent.
+The failed waterfall reads `A 21ms -> client 3ms ERROR refused; no B span`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-a61d09`, `source=order-a-4.18.2-v7n4j`, `backend=inventory-b-3`, and `server.address=10.42.7.23:8080` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `ConnectException: Connection refused /10.42.7.23:8080`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
 
 ```text
-Service A                         Service B
-   | -------- SYN -----------------> |
-   | <----- SYN-ACK ---------------- |
-   | -------- ACK -----------------> |
-   |        connection established   |
+2026-09-13T10:02:22.417Z level=ERROR request_id=ord-a61d09 trace_id=02f92f3577b34da6a3ce929d0e0e0002
+source_instance=order-a-4.18.2-v7n4j backend=inventory-b-3 target=10.42.7.23:8080
+message="ConnectException: Connection refused /10.42.7.23:8080"
 ```
 
-A refusal commonly looks like:
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
+
+## Safe config, runtime, network, and direct-path test
+
+The exact next test is to compare ss listener output on B-3 and B-2.
+I run one or a few bounded probes from A's real execution context and one matched control.
 
 ```text
-Service A                         Destination
-   | -------- SYN -----------------> |
-   | <--------- RST ---------------- |
-   |        connection refused       |
+FAIL request=ord-a61d09 source=order-a-4.18.2-v7n4j target=10.42.7.23:8080
+RESULT B-3 127.0.0.1:8080; B-2 0.0.0.0:8080
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
 ```
 
-The refusal often proves that packets reached the destination IP or a network device that actively rejected the connection. It does **not** prove that the Service B application was reached.
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
 
-## Where the refusal can originate
+### Result branches
 
-- The operating system on the Service B host because no process listens on that port.
-- A container or pod IP where the application has not started listening.
-- A load balancer listener with no matching port or target.
-- A reverse proxy or sidecar that rejects the connection.
-- A firewall configured to `REJECT` rather than silently `DROP`.
-- A stale IP belonging to a different host.
-
-## Detailed causes
-
-| Cause | Why it produces a refusal | Evidence |
+| Test result | Interpretation | Next evidence |
 |---|---|---|
-| Service B process is stopped or crashed | The host has no listener for the port | No listening socket; startup/crash logs |
-| Wrong destination port | Another port is used or nothing listens on the configured port | Config says `8080`; `ss` shows `8081` |
-| Application startup is incomplete | Container is running before the web server binds | Startup logs stop before "server started"; readiness false |
-| Listener is bound only to loopback | Remote packets arrive on another interface with no matching listener | `127.0.0.1:8080` instead of `0.0.0.0:8080` |
-| Wrong or stale IP | DNS/discovery points to a host that does not run B | DNS answer differs from current service endpoints |
-| Kubernetes `targetPort` is wrong | Service forwards to a port the pod does not expose | Service `targetPort` differs from pod listener |
-| Load balancer includes a dead target | Some connections are sent to an instance with no listener | Failures correlate with one target IP |
-| Rolling deployment race | Traffic reaches a terminating or not-yet-ready instance | Refusals occur during rollout; endpoint removal is delayed |
-| Firewall actively rejects | A network device sends a reset or reject response | Packet capture or firewall logs identify reject |
-| Protocol endpoint is wrong | Client connects to a port not configured for that service | Listener inventory and gateway configuration mismatch |
-| Host port is not published | Container listens internally, but host/NAT mapping is absent | Container works locally; host port has no listener |
-| Service-mesh sidecar is not ready | Traffic is redirected to a proxy listener that is unavailable | Sidecar startup/readiness and redirect rules |
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
 
-## Step-by-step debugging
+## Alternate branches kept alive
 
-### Step 1 - Confirm that this is a refusal
+The symptom can have several causes; I reject each only with boundary evidence.
 
-Capture the exact host, resolved IP, port, and nested exception:
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
 
-```text
-ConnectException: Connection refused
-destination=10.20.4.18:8080
-```
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
 
-An immediate failure strongly supports refusal. A failure only after the configured connect timeout is more likely a packet drop or reachability issue.
+## Fully worked causal chain
 
-### Step 2 - Resolve and record every destination IP
+1. At 10:02 UTC the triggering production state changed.
+2. B-3 loaded SERVER_ADDRESS=127.0.0.1 from a stale node ConfigMap instead of 0.0.0.0.
+3. Mechanically, kernel reset pod-IP traffic because only loopback had a listener.
+4. Therefore `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero`.
+5. Trace `02f92f3577b34da6a3ce929d0e0e0002` showed `A 21ms -> client 3ms ERROR refused; no B span`.
+6. It selected log evidence `ConnectException: Connection refused /10.42.7.23:8080`.
+7. The safe failed/control comparison showed `B-3 127.0.0.1:8080; B-2 0.0.0.0:8080`.
+8. That explains the customer scope: one third of reservations, only target B-3.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
 
-```powershell
-Resolve-DnsName service-b
-```
+## Mitigation is not root cause
 
-```bash
-getent ahosts service-b
-```
+**Mitigation:** I drain B-3 after preserving config and sockets.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
 
-If multiple IPs are returned, test each one. One stale address can make a refusal intermittent.
+**Root cause:** B-3 loaded SERVER_ADDRESS=127.0.0.1 from a stale node ConfigMap instead of 0.0.0.0.
+It lives at `TCP listener on B-3` and explains why kernel reset pod-IP traffic because only loopback had a listener.
+A workaround that clears current state does not correct this mechanism.
 
-### Step 3 - Reproduce the TCP connection from Service A
+## Permanent correction
 
-```powershell
-Test-NetConnection service-b -Port 8080 -InformationLevel Detailed
-```
+The primary fix is to remove override, validate non-loopback bind, and gate readiness on remote reachability.
+I apply only controls supported by the incident evidence:
 
-```bash
-nc -vz -w 5 service-b 8080
-```
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
 
-Test the hostname first, then each resolved IP. Record whether all destinations refuse or only one does.
+## Verification of recovery
 
-### Step 4 - Check the listener on Service B
+The incident-specific target is: refusals 0 and B-3 balanced with peers for 30 minutes.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
 
-Windows:
+## Recurrence prevention
 
-```powershell
-Get-NetTCPConnection -LocalPort 8080 -State Listen
-netstat -ano | findstr :8080
-```
-
-Linux:
-
-```bash
-ss -lntp | grep ':8080'
-```
-
-Confirm:
-
-- A listener exists.
-- The owning process is Service B.
-- The port is correct.
-- The bind address is reachable remotely.
-- Both IPv4 and IPv6 behavior match the client.
-
-Examples:
-
-```text
-127.0.0.1:8080   -> local callers only
-0.0.0.0:8080     -> all IPv4 interfaces
-[::]:8080        -> IPv6 and sometimes dual-stack, depending on OS settings
-```
-
-### Step 5 - Inspect application startup
-
-Look for:
-
-- Port already in use.
-- Invalid configuration.
-- Missing secret.
-- Failed dependency initialization.
-- Certificate/key load failure.
-- Framework started but embedded HTTP server failed.
-- Crash loop or out-of-memory termination.
-
-A `Running` container state is not enough. Confirm the application emitted its normal "ready/listening" event.
-
-### Step 6 - Check container or Kubernetes port mapping
-
-For Kubernetes:
-
-```bash
-kubectl get service -n <namespace> service-b -o yaml
-kubectl get endpointslice -n <namespace> -l kubernetes.io/service-name=service-b -o yaml
-kubectl get pods -n <namespace> -l app=service-b -o wide
-```
-
-Verify:
-
-```text
-Service port -> targetPort -> container listener
-selector -> intended pods
-endpoint IPs -> current ready pods
-```
-
-The `containerPort` field documents a port but does not itself make the application listen. The actual process listener is what matters.
-
-### Step 7 - Check load balancer and service discovery
-
-Confirm that:
-
-- The rejected IP is a current backend.
-- Health checks use the correct port and protocol.
-- Draining targets are removed before their listener closes.
-- Registration is not stale.
-- Traffic is not sent to a startup-incomplete instance.
-
-### Step 8 - Check reject rules only after listener checks
-
-Inspect host firewall, security appliance, Kubernetes policy, or proxy logs for an explicit reject. Most dropped firewall traffic causes a timeout, while an explicit reject can cause an immediate refusal.
-
-### Step 9 - Correct and prove
-
-Typical permanent fixes:
-
-- Start or stabilize the Service B process.
-- Correct host/port configuration.
-- Bind to the intended interface.
-- Correct Service `targetPort`, load balancer target port, or container publishing.
-- Make readiness depend on the HTTP listener being ready.
-- Add graceful shutdown and endpoint draining.
-- Remove stale discovery records.
-- Alert on missing listeners, failed readiness, and target-health changes.
-
-Verify from Service A, through the normal hostname and intermediary path, and across every returned backend.
+I alert on business SLO plus `attempts 225/s; refusals 74/s in 1-3ms; B-3 HTTP rate is zero` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
 
 ## Interview-ready answer
 
-> Connection refused usually means the TCP attempt reached a host or device that actively rejected the port, commonly because nothing is listening. I would capture the resolved IP and port, reproduce from Service A, and test every resolved address. On B I would verify the process, startup completion, listening socket, bind address, and owning process. In containers or Kubernetes I would trace Service port to `targetPort` to the real pod listener and inspect endpoint readiness. I would also check for stale load-balancer targets, rollout races, sidecar readiness, and explicit firewall rejects. I would fix the incorrect listener or routing state and verify the real path from A rather than treating a restart as the root cause.
+> At 10:02 UTC I saw immediate connection refusals on roughly one third of reservations. The fraction matched one of three targets, so I split A and gateway metrics by backend. Every failure selected B-3, completed in 1-3 ms, and had no TLS phase or B server span. DNS was correct, peers were healthy, and B-3's application resources were idle. Comparing listening sockets showed B-3 bound to `127.0.0.1:8080`, whereas B-2 used `0.0.0.0:8080`; a stale node-specific ConfigMap supplied the loopback value. I preserved the instance evidence and drained B-3 as mitigation. I then removed the override, added startup validation for external binds, and required a remote readiness test. I verified balanced traffic to B-3, zero refusals, and stable business success for thirty minutes.
 
 ---
 
-# 4. Question 3 - Connection Timeout
+# Incident 3: A Connect Timeout Traces to Policy
 
 ## Interview question
 
 > Service A is getting a connection timeout while calling Service B. How would you troubleshoot it?
 
-## What a connection timeout means
+## The page arrives
 
-A connection timeout occurs before the TCP connection is established. Service A sends connection attempts, but the handshake does not complete before the client connect deadline.
+At 11:27 UTC on 2026-09-13, a connect timeout traces to policy.
+The first failed request is `ord-18b44e`, trace `03f92f3577b34da6a3ce929d0e0e0003`, from `order-a-4.19.0-r4w9p` toward `10.42.7.18:8080` and target label `inventory-b-r8x2p`.
+The measured scope is new A 4.19.0 only; old A succeeds; every B is affected.
+The first metric sentence is: new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
+
+## What I do in the first five minutes
+
+### Minute 0-1: make the symptom exact
+
+I write `11:27 UTC | request=ord-18b44e | source=order-a-4.19.0-r4w9p | target=10.42.7.18:8080 | scope=new A 4.19.0 only; old A succeeds; every B is affected`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
+
+### Minute 1-2: define the blast radius
+
+I split the dataset until I can state: new A 4.19.0 only; old A succeeds; every B is affected.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
+
+### Minute 2-3: open the exact dashboard
+
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `NetworkPolicy before B TCP`, but it remains a hypothesis.
+
+### Minute 3-4: count across boundaries
+
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
+
+### Minute 4-5: preserve evidence
+
+I save trace `03f92f3577b34da6a3ce929d0e0e0003`, sanitized logs for `ord-18b44e`, target `inventory-b-r8x2p`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
+
+## Metric-by-metric causal walk
+
+### Version-scoped business and client signals
+
+At 11:27 UTC the customer failure is confined to A version 4.19.0. Old 4.18.2 pods continue reserving against the same B fleet, which makes a shared B outage unlikely. Request rate is ordinary, but the new version records 61 connect timeouts/s, each ending at 5.000 seconds.
+
+A's pool acquisition is 2 ms and DNS lookup is 3 ms with the same B addresses as old pods. Those normal phases place the wait after resolution and before TLS. If DNS were slow, total time would accumulate in the lookup bucket instead of the connect bucket.
+
+### TCP path split by source version
+
+New pods show SYN retransmissions at 4.1/s per pod and zero successful connects. Old pods connect to the identical `10.42.7.18:8080` target in 8 ms. There is no RST, so this is not a closed port; packets are disappearing before the handshake completes. The exact five-second plateau is A's connect timeout, not B execution time.
+
+TLS, gateway upstream, and B server metrics remain flat for new-pod failures because those layers are never reached. B continues serving old A pods at 140 ms p99. A missing B span is therefore expected, and I do not inspect B's database.
+
+### Policy and label evidence
+
+I compare source dimensions before blaming the network generally. Failures follow version 4.19.0 on every node and zone, not one node interface. New pod labels contain `app.kubernetes.io/name=order-api`; the egress NetworkPolicy selects `app=order-api`. Old pods carry both labels and are allowed.
+
+A bounded TCP probe from one old pod returns `Connected ... 8 ms`; the same probe from a new pod times out at 5,000 ms. Read-only policy and flow telemetry show drops for the new source identity. If both pods had timed out, I would move to the destination route/firewall; if one node alone failed, I would compare CNI and node routes.
+
+B CPU, queues, thread pools, HTTP/DB pools, and dependency rates remain normal. Their flat shape is mechanically consistent with never receiving the new calls. Retry count remains one because connect retries are disabled; enabling them would multiply dropped SYNs and consume the order deadline.
+
+The rollout annotation at 11:24:03 precedes the first new-source timeout. The selector mismatch explains the version boundary, retransmission pattern, absent downstream traffic, and recovery when the expected label is restored.
+
+## Trace: follow parent to the failing child
+
+I search trace `03f92f3577b34da6a3ce929d0e0e0003` and start at the A server parent.
+The failed waterfall reads `A 5.006s -> client connect 5.001s ERROR; no B span`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-18b44e`, `source=order-a-4.19.0-r4w9p`, `backend=inventory-b-r8x2p`, and `server.address=10.42.7.18:8080` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `ConnectTimeoutException after 5000ms`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
 
 ```text
-Service A                         Service B or network
-   | -------- SYN -----------------> |
-   |                                  |
-   | -------- retry SYN ------------> |
-   |                                  |
-   | -------- retry SYN ------------> |
-   |                                  |
-   X connect timeout
+2026-09-13T11:27:22.417Z level=ERROR request_id=ord-18b44e trace_id=03f92f3577b34da6a3ce929d0e0e0003
+source_instance=order-a-4.19.0-r4w9p backend=inventory-b-r8x2p target=10.42.7.18:8080
+message="ConnectTimeoutException after 5000ms"
 ```
 
-This differs from:
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
 
-- `Connection refused`: an active rejection normally arrives quickly.
-- Read timeout: a connection was established, but response data was late.
-- TLS timeout: TCP may have succeeded, but secure negotiation stalled.
+## Safe config, runtime, network, and direct-path test
 
-## Detailed causes
-
-| Cause | Where it occurs | Why the handshake does not finish |
-|---|---|---|
-| Firewall or security group drops traffic | Source, destination, or intermediate network | SYN or SYN-ACK is silently discarded |
-| Kubernetes NetworkPolicy blocks A-to-B traffic | Cluster network | Policy denies ingress or egress |
-| Missing or incorrect route | Host, subnet, VPC/VNet, VPN, peering | Packet cannot reach the destination or return path |
-| Wrong IP from config, DNS, or discovery | Client/discovery | Client targets an unused or unreachable address |
-| Wrong port with silent filtering | Network/device | Traffic to that port is dropped instead of rejected |
-| Asymmetric routing | Network | SYN reaches B, but SYN-ACK returns through a path that drops it |
-| NAT/SNAT or ephemeral-port exhaustion | Egress gateway, node, host | New outbound connections cannot obtain usable translation state |
-| Connection-tracking table exhaustion | Host, node, firewall | New flows are dropped |
-| Destination or load balancer overload | Backend/LB | Accept path, SYN backlog, or appliance capacity is exhausted |
-| Proxy required but bypassed, or unwanted proxy used | Service A runtime | Request goes to an unreachable direct path or proxy |
-| Private endpoint used from an unconnected network | Cross-environment networking | No valid route or permission exists |
-| IPv6/IPv4 mismatch | DNS/client/network | Client selects an address family not supported end to end |
-| Cloud network ACL mismatch | Subnet boundaries | Stateless return-path rule blocks ephemeral traffic |
-| Node or zone network fault | Infrastructure | Only workloads on a node/AZ experience timeouts |
-
-## Step-by-step debugging
-
-### Step 1 - Verify the timeout phase and value
-
-Confirm the exception says **connect** timeout and record:
-
-- Connect timeout configured by Service A.
-- Number of retries and retry delay.
-- Total elapsed time.
-- Resolved destination IP.
-
-Retries can make a 3-second connect timeout appear as a 12-second application failure. Understand the whole retry timeline.
-
-### Step 2 - Compare scope
-
-Ask:
-
-- Do all Service A instances time out?
-- Does one node, subnet, region, or availability zone fail?
-- Do all destination IPs fail?
-- Did the issue begin with a network, DNS, scaling, or deployment event?
-- Are only new connections failing while existing keep-alive connections work?
-
-If existing connections work but new ones time out, investigate NAT ports, conntrack, accept queues, load balancer capacity, and new-connection rate.
-
-### Step 3 - Resolve DNS and test every address
-
-```powershell
-Resolve-DnsName service-b
-Test-NetConnection service-b -Port 8080 -InformationLevel Detailed
-```
-
-```bash
-getent ahosts service-b
-nc -vz -w 5 service-b 8080
-```
-
-Test from each affected Service A instance when the problem is instance-specific.
-
-### Step 4 - Compare direction and return path
-
-Network communication requires both directions:
+The exact next test is to compare labels/selectors then bounded TCP probes from old/new pods.
+I run one or a few bounded probes from A's real execution context and one matched control.
 
 ```text
-A -> B : SYN
-B -> A : SYN-ACK
+FAIL request=ord-18b44e source=order-a-4.19.0-r4w9p target=10.42.7.18:8080
+RESULT old Connected 8ms; new timed out 5000ms
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
 ```
 
-An ingress rule may allow the SYN while an egress, network ACL, route, NAT, or asymmetric path drops the SYN-ACK. Check both source and destination routes and policies.
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
 
-### Step 5 - Inspect network controls
+### Result branches
 
-Trace the actual path and evaluate:
-
-- Source host firewall.
-- Destination host firewall.
-- Cloud security groups.
-- Stateless network ACLs in both directions.
-- Kubernetes ingress and egress NetworkPolicies.
-- Service-mesh authorization and egress policy.
-- VPC/VNet route tables, peering, VPN, transit gateway, private-link rules.
-- NAT gateway and SNAT utilization.
-- Corporate proxy and `NO_PROXY` behavior.
-
-Do not assume a rule applies because its name sounds correct. Verify source identity/CIDR, destination CIDR, protocol, destination port, and return ephemeral ports.
-
-### Step 6 - Inspect the destination
-
-Even though a missing listener often refuses immediately, a destination under severe load or protected by a dropping firewall may time out. Check:
-
-- Listener and bind address.
-- SYN backlog and accept queue.
-- Host CPU and network saturation.
-- Load balancer target and listener capacity.
-- Node conntrack usage.
-- Pod/node health.
-
-### Step 7 - Use packet evidence when standard checks are inconclusive
-
-With authorization, capture narrowly filtered packets on the source and destination:
-
-```bash
-tcpdump -nn -i any host <destination-ip> and port 8080
-```
-
-Interpretation:
-
-| Source capture | Destination capture | Likely conclusion |
+| Test result | Interpretation | Next evidence |
 |---|---|---|
-| SYN leaves; B sees no SYN | No inbound SYN | Drop or route problem before B |
-| SYN leaves; B sees SYN and sends SYN-ACK; A sees no SYN-ACK | Return packet missing | Return-route, ACL, firewall, NAT, or asymmetry |
-| A sees SYN and immediate RST | Active rejection | Treat as refusal, inspect listener/rejecting device |
-| Handshake completes | Not a connect timeout at this layer | Move to TLS, HTTP, or read phase |
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
 
-Packet capture should be targeted, approved, short-lived, and protected because payloads and addresses can be sensitive.
+## Alternate branches kept alive
 
-### Step 8 - Check saturation and new-connection behavior
+The symptom can have several causes; I reject each only with boundary evidence.
 
-Review:
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
 
-- New connections per second.
-- Active and failed connections.
-- NAT/SNAT port use.
-- Conntrack table use.
-- Load balancer rejected connections.
-- TCP retransmissions.
-- SYN backlog drops.
-- File descriptor usage.
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
 
-A retry storm can worsen exhaustion. If many clients retry simultaneously, use capped exponential backoff with jitter and a strict overall deadline.
+## Fully worked causal chain
 
-### Step 9 - Fix and verify
+1. At 11:27 UTC the triggering production state changed.
+2. NetworkPolicy selected app=order-api but new pods used app.kubernetes.io/name=order-api.
+3. Mechanically, policy dropped SYNs until the five-second connect deadline.
+4. Therefore `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise`.
+5. Trace `03f92f3577b34da6a3ce929d0e0e0003` showed `A 5.006s -> client connect 5.001s ERROR; no B span`.
+6. It selected log evidence `ConnectTimeoutException after 5000ms`.
+7. The safe failed/control comparison showed `old Connected 8ms; new timed out 5000ms`.
+8. That explains the customer scope: new A 4.19.0 only; old A succeeds; every B is affected.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
 
-Permanent fixes may include:
+## Mitigation is not root cause
 
-- Correct routes, security groups, ACLs, firewall, or NetworkPolicy.
-- Correct the destination IP, hostname, port, or address family.
-- Add or repair peering/private connectivity.
-- Increase NAT or load-balancer capacity after proving exhaustion.
-- Reuse connections and configure pools to reduce connection churn.
-- Fix proxy and `NO_PROXY` configuration.
-- Repair node networking or replace a faulty node through the normal operational process.
-- Add synthetic TCP checks from the same network zones as Service A.
+**Mitigation:** I pause rollout and restore the expected label.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
 
-Verify new connections, not only already-open pooled connections.
+**Root cause:** NetworkPolicy selected app=order-api but new pods used app.kubernetes.io/name=order-api.
+It lives at `NetworkPolicy before B TCP` and explains why policy dropped SYNs until the five-second connect deadline.
+A workaround that clears current state does not correct this mechanism.
+
+## Permanent correction
+
+The primary fix is to use stable identity labels and add caller-context policy tests.
+I apply only controls supported by the incident evidence:
+
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
+
+## Verification of recovery
+
+The incident-specific target is: new-pod connect p99 <15ms, retransmits baseline, errors 0.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
+
+## Recurrence prevention
+
+I alert on business SLO plus `new A connect timeouts 61/s pinned at 5.000s; B rate flat; SYN retransmits rise` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
 
 ## Interview-ready answer
 
-> A connection timeout means the TCP handshake did not finish before the connect deadline. I would first confirm the phase, timeout, retries, destination IP, and affected source and destination instances. From Service A I would resolve DNS and test each address and port. Then I would check both forward and return routes, source and destination firewalls, security groups, stateless ACLs, Kubernetes ingress and egress policies, proxy rules, NAT/SNAT capacity, and load-balancer state. If necessary, a narrow packet capture would show whether the SYN reaches B and whether the SYN-ACK returns. I would also investigate new-connection saturation such as conntrack, NAT ports, or SYN backlog. After correcting the actual path or capacity issue, I would verify fresh connections from every affected zone.
+> I would scope a connection timeout by caller and target before changing any timeout. Here only A 4.19.0 failed: DNS completed in 3 ms, but TCP connect attempts retransmitted and ended exactly at the five-second budget, while old A pods reached the same B address in 8 ms. No TLS, gateway upstream, or B server span existed for the failed calls. Comparing the new pod labels with the NetworkPolicy showed that the policy selected `app=order-api`, but the rollout supplied only `app.kubernetes.io/name=order-api`. I paused the rollout and restored the stable identity label. The permanent correction used immutable labels and added policy connectivity tests. I verified sub-15-ms connects from new pods, baseline retransmissions, matching B accepts, zero customer errors, and a clean rollout.
 
 ---
 
-# 5. Question 4 - Read Timeout
+# Incident 4: A Read Timeout Finds a DB Lock
 
 ## Interview question
 
-> Service A connects to Service B, but the response takes too long and eventually gets a read timeout. What could be happening?
+> Service A connects to Service B, but the response takes too long and eventually gets a Read Timeout. What could be happening?
 
-## What a read timeout means
+## The page arrives
 
-The client established a connection and then waited too long for response data. Depending on the HTTP library, the timeout may apply to:
+At 12:41 UTC on 2026-09-13, a read timeout finds a DB lock.
+The first failed request is `ord-c82ee1`, trace `04f92f3577b34da6a3ce929d0e0e0004`, from `order-a-4.18.2-k2m5q` toward `10.42.7.18:8080` and target label `inventory-b-r8x2p`.
+The measured scope is warehouse 17 reservation writes; reads and other warehouses normal.
+The first metric sentence is: A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
 
-- Time until the first response byte.
-- Maximum idle time between response bytes.
-- A socket read operation.
-- The entire response body.
+## What I do in the first five minutes
 
-Confirm the library's exact definition. An overall request deadline is different from a socket read timeout.
+### Minute 0-1: make the symptom exact
+
+I write `12:41 UTC | request=ord-c82ee1 | source=order-a-4.18.2-k2m5q | target=10.42.7.18:8080 | scope=warehouse 17 reservation writes; reads and other warehouses normal`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
+
+### Minute 1-2: define the blast radius
+
+I split the dataset until I can state: warehouse 17 reservation writes; reads and other warehouses normal.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
+
+### Minute 2-3: open the exact dashboard
+
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `B database child`, but it remains a hypothesis.
+
+### Minute 3-4: count across boundaries
+
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
+
+### Minute 4-5: preserve evidence
+
+I save trace `04f92f3577b34da6a3ce929d0e0e0004`, sanitized logs for `ord-c82ee1`, target `inventory-b-r8x2p`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
+
+## Metric-by-metric causal walk
+
+### Business and A timing
+
+At 12:41 UTC order volume is flat, but warehouse-17 reservations time out at 31/s. Reads and other warehouses remain below 180 ms. A's DNS, connect, and TLS p99 values stay at 3, 8, and 14 ms, so the five-second total is not connection setup.
+
+A's time to first byte rises to the five-second read deadline. The client has 24 active connections, 76 idle, zero pending, and 2 ms pool acquisition. If pool pending were high, the wait would occur before the request left A; instead established connections wait for a response.
+
+### Gateway and B receive the requests
+
+Gateway upstream connect remains 8 ms, while upstream response p99 rises to 5.18 s for warehouse 17. The gateway and B rates match A attempts, and B access logs contain `ord-c82ee1`. That moves the investigation through transport into B.
+
+B p50 remains 128 ms because most routes are healthy, while p99 reaches 5.2 s and max 6.4 s. The warehouse split exposes the tail that an average hides. B in-flight climbs from 28 to 173. At 220 requests/s, adding roughly 0.7 seconds of average residence predicts about 154 extra concurrent requests by Little's Law; the measured growth is plausible.
+
+### Runtime, pools, and the dependency child
+
+B CPU is only 38%, throttling zero, heap 59%, and GC max 27 ms. Workers are waiting rather than computing or pausing. The worker queue reaches 41 but no tasks are rejected. Adding threads would create more blocked transactions against the same rows.
+
+The DB pool is active 38/40, idle 2, pending p99 11 ms. Pool acquisition is not the 4.7-second owner. The failed trace shows the subsequent `UPDATE inventory` child lasting 4.70 s, of which `db.lock.wait` is 4.63 s. Cache and Pricing C spans remain under 20 ms.
+
+Database CPU and IO are normal, but lock-wait p99 for fingerprint `reserve-stock` jumps from 8 ms to 4.7 s. A read-only activity view identifies blocker `pid-2218`, application `inventory-reconcile`, job `job-882`. If rows examined had surged with no lock event, I would investigate an index/plan; if acquisition had consumed the time, I would look for slow holders or leaks.
+
+The batch started at 12:39:52 and changed to one transaction for all warehouse-17 rows. It held locks long enough for A's five-second read deadline to expire, even though TCP and B remained alive. That causal sequence selects pausing the owned batch, not increasing the timeout.
+
+## Trace: follow parent to the failing child
+
+I search trace `04f92f3577b34da6a3ce929d0e0e0004` and start at the A server parent.
+The failed waterfall reads `A 5.001s ERROR -> B 5.19s -> DB UPDATE 4.70s lock wait`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-c82ee1`, `source=order-a-4.18.2-k2m5q`, `backend=inventory-b-r8x2p`, and `server.address=10.42.7.18:8080` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `query=reserve-stock lock_wait_ms=4698`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
 
 ```text
-A -- TCP/TLS connected --> B
-A -- request -----------> B
-                          B queues or processes
-                          B waits for DB/C/resource
-A <--- no response within read timeout
-X read timeout
+2026-09-13T12:41:22.417Z level=ERROR request_id=ord-c82ee1 trace_id=04f92f3577b34da6a3ce929d0e0e0004
+source_instance=order-a-4.18.2-k2m5q backend=inventory-b-r8x2p target=10.42.7.18:8080
+message="query=reserve-stock lock_wait_ms=4698"
 ```
 
-## Where time can be spent
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
+
+## Safe config, runtime, network, and direct-path test
+
+The exact next test is to open longest trace child and inspect read-only lock activity.
+I run one or a few bounded probes from A's real execution context and one matched control.
 
 ```text
-Client pool wait
-  + proxy/gateway queue
-  + Service B accept/request queue
-  + Service B thread queue
-  + application code
-  + DB pool wait
-  + DB execution/lock wait
-  + downstream HTTP pool wait
-  + downstream service latency
-  + serialization/compression
-  + response network transfer
-  = end-to-end latency
+FAIL request=ord-c82ee1 source=order-a-4.18.2-k2m5q target=10.42.7.18:8080
+RESULT DB UPDATE 4.70s; lock.wait 4.63s blocked_by pid-2218
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
 ```
 
-## Detailed causes
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
 
-| Cause | Mechanism | Evidence |
+### Result branches
+
+| Test result | Interpretation | Next evidence |
 |---|---|---|
-| Slow business logic | CPU-heavy algorithm, lock, synchronous work, inefficient loop | Long in-process trace span; CPU or profiler evidence |
-| Request queueing | All worker threads/event loops are busy | Queue depth and active threads at maximum |
-| Thread-pool exhaustion | Request waits for a worker | Pool active=max, queued tasks rising |
-| DB connection-pool exhaustion | B waits to borrow a DB connection | Pool wait time and pending borrowers rise |
-| Slow query or missing index | DB execution exceeds normal latency | Query span, execution plan, slow-query log |
-| DB blocking or lock contention | Query waits behind another transaction | DB lock/wait diagnostics |
-| Downstream Service C is slow | B's deadline is consumed by C | Trace shows long B-to-C span |
-| HTTP client pool exhaustion | B waits for a reusable downstream connection | Pending connection requests and pool max |
-| CPU throttling or saturation | Work receives too little CPU time | CPU limit/throttle metrics, run queue |
-| GC pause or memory pressure | Application pauses or spends time collecting | GC pause metrics/logs, heap pressure |
-| Deadlock or blocked thread | Work never progresses | Thread dump or runtime diagnostics |
-| Large request or response | Parse, serialize, compress, and transfer take longer | Duration correlates with payload size |
-| Slow external system | Provider latency holds B open | Downstream metrics and provider logs |
-| Network stall after connection | Packets are lost or flow is interrupted | Retransmissions, proxy/network metrics |
-| Timeout is below valid service objective | Healthy long-running operation exceeds caller limit | Baseline p99 is greater than configured timeout |
-| Retry amplification | A or B repeats slow operations and increases load | Multiple attempts per request ID; load spikes |
-| Synchronous work should be asynchronous | Long job is incorrectly held inside HTTP request | Endpoint waits for batch/report/export completion |
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
 
-## Step-by-step debugging
+## Alternate branches kept alive
 
-### Step 1 - Identify who timed out
+The symptom can have several causes; I reject each only with boundary evidence.
 
-Determine whether the message came from:
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
 
-- Service A HTTP client.
-- Service A's inbound gateway.
-- A service-mesh sidecar.
-- API gateway or load balancer.
-- Service B's downstream client.
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
 
-Record connect, read, write, idle, and total/request deadlines at every hop. The shortest deadline normally fires first.
+## Fully worked causal chain
 
-### Step 2 - Confirm that Service B received the request
+1. At 12:41 UTC the triggering production state changed.
+2. batch job job-882 held warehouse-17 row locks for 4.7-6.1s in one transaction.
+3. Mechanically, B workers connected then waited on locks beyond A's deadline.
+4. Therefore `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%`.
+5. Trace `04f92f3577b34da6a3ce929d0e0e0004` showed `A 5.001s ERROR -> B 5.19s -> DB UPDATE 4.70s lock wait`.
+6. It selected log evidence `query=reserve-stock lock_wait_ms=4698`.
+7. The safe failed/control comparison showed `DB UPDATE 4.70s; lock.wait 4.63s blocked_by pid-2218`.
+8. That explains the customer scope: warehouse 17 reservation writes; reads and other warehouses normal.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
 
-Use request ID, trace ID, timestamp, method, and path.
+## Mitigation is not root cause
 
-- No B access log or trace: delay may be before B, in a gateway queue, connection reuse problem, request-write phase, or wrong target.
-- B start log exists but no completion: investigate B and its dependencies.
-- B completed before A timed out: investigate response delivery, proxy buffering, stale connection, client parsing, or mismatched clocks/timestamps.
-- B completed after A timed out: investigate B latency and cancellation handling.
+**Mitigation:** I pause job-882 through its scheduler and let transaction finish.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
 
-### Step 3 - Build a latency waterfall
+**Root cause:** batch job job-882 held warehouse-17 row locks for 4.7-6.1s in one transaction.
+It lives at `B database child` and explains why B workers connected then waited on locks beyond A's deadline.
+A workaround that clears current state does not correct this mechanism.
 
-Distributed tracing is ideal:
+## Permanent correction
 
-```text
-Total request:                5.02 s
-  Gateway queue:              0.04 s
-  Service B queue:            0.82 s
-  Service B application:      0.11 s
-  DB connection wait:         1.20 s
-  DB query:                   2.73 s
-  Serialization/response:     0.12 s
-```
+The primary fix is to commit small batches, index predicate, and bound lock wait below deadline.
+I apply only controls supported by the incident evidence:
 
-The waterfall prevents blaming the longest-looking component without accounting for queue time.
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
 
-Without tracing, correlate logs with monotonic durations where available:
+## Verification of recovery
 
-```text
-A call start
-B request start
-B downstream start/end
-B request end
-A timeout
-```
+The incident-specific target is: lock p99 <20ms, B p99 <180ms, timeouts 0, reservations reconcile.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
 
-### Step 4 - Separate queue time from execution time
+## Recurrence prevention
 
-Low CPU does not prove the service is healthy. A service can be idle while all threads wait on locks, pools, or downstream I/O.
-
-Inspect:
-
-- Request queue length.
-- Active, idle, maximum, and rejected worker threads.
-- Event-loop blocked time for nonblocking runtimes.
-- DB/HTTP pool active, idle, pending, acquire time, and timeout.
-- Semaphore or bulkhead utilization.
-- Lock waits and thread states.
-
-### Step 5 - Inspect resource metrics per instance
-
-Check the same time window and instance:
-
-- CPU utilization and CPU throttling.
-- Memory working set/heap and allocation rate.
-- GC frequency and pause duration.
-- Thread count and blocked threads.
-- File descriptors and sockets.
-- Network errors/retransmissions.
-- Disk latency if local I/O is involved.
-- Container restarts and node pressure.
-
-Use percentiles rather than averages. A normal average can hide a severe p99 tail.
-
-### Step 6 - Inspect the database
-
-Look for:
-
-- Pool wait before query execution.
-- Slow query duration.
-- Lock/blocking time.
-- Missing/unused index.
-- Bad execution plan or parameter sensitivity.
-- Large result set.
-- Connection errors or failover.
-- Database CPU, I/O, memory, and connection saturation.
-- Transaction held open too long.
-
-Do not add an index or terminate a query solely from an application timeout. Confirm with database evidence and follow the database change process.
-
-### Step 7 - Inspect every downstream call
-
-For each `B -> C` call, record:
-
-- DNS/connect/TLS/request/response duration.
-- Timeout and retry policy.
-- Circuit-breaker state.
-- Pool wait.
-- Status code.
-- Downstream instance.
-
-Ensure B's downstream timeout fits inside B's own remaining deadline. Otherwise, A can time out while B is still waiting on C.
-
-### Step 8 - Check request-specific patterns
-
-Compare fast and slow requests by:
-
-- Endpoint and method.
-- Tenant/customer.
-- Record ID and data shape.
-- Payload and response size.
-- Cache hit/miss.
-- Query plan.
-- Feature flag.
-- Destination instance.
-- Time of day and traffic level.
-
-### Step 9 - Check timeout and retry design
-
-A good timeout budget is layered:
-
-```text
-Caller total deadline
-  > gateway timeout plus network margin
-  > Service B internal deadline plus response margin
-  > each downstream timeout and bounded retries
-```
-
-Do not automatically increase the timeout. That can:
-
-- Keep threads and connections occupied longer.
-- Increase queue length.
-- Hide a regression.
-- Cause more work to continue after callers abandon it.
-- Turn a fast failure into a large cascading outage.
-
-Increase a timeout only if the operation's valid service-level objective requires it and the system has enough capacity.
-
-### Step 10 - Fix the bottleneck and verify under representative load
-
-Possible fixes:
-
-- Optimize query/code or reduce result size.
-- Remove lock contention.
-- Correct pool sizing based on dependency capacity.
-- Add bounded concurrency and backpressure.
-- Move legitimately long work to an asynchronous job.
-- Propagate deadlines and cancellation.
-- Tune CPU/memory only after proving resource constraint.
-- Correct retries and add exponential backoff with jitter.
-- Cache suitable data with correct invalidation.
-- Align timeout budgets with the service objective.
-
-Verify p50, p95, p99, timeout rate, pool wait, queue depth, dependency latency, and resource saturation.
+I alert on business SLO plus `A read timeout 31/s at 5s; B p99 5.2s; DB lock wait p99 4.7s; CPU 38%` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
 
 ## Interview-ready answer
 
-> A read timeout means the connection was established but response data did not arrive within the client's read deadline. I would identify which component timed out and its exact timeout semantics, then use a request or trace ID to confirm whether B received and completed the request. I would build a latency waterfall that separates gateway and service queueing, application execution, pool waits, database time, downstream calls, and response transfer. I would inspect per-instance CPU, throttling, GC, threads, connection pools, locks, query plans, and downstream latency, and compare slow requests with successful ones by endpoint, data, payload, and instance. I would fix the measured bottleneck and align deadlines; I would not simply increase the timeout because that can worsen saturation and hide the root cause.
+> At 12:41 UTC I found that read timeouts affected only warehouse-17 reservation writes. A's DNS, TCP, TLS, and pool acquisition were normal, but time to first byte reached the five-second deadline. Gateway and B rates matched A's attempts, and B p99 rose to 5.2 seconds. In the failed trace, a 4.70-second database update contained 4.63 seconds of lock wait; CPU, GC, and pool acquisition were normal. A read-only lock view linked the query fingerprint to reconciliation job `job-882`, which was holding the warehouse rows in one large transaction. I paused that job to mitigate impact. The durable fix used small commits, an indexed predicate, and a lock budget below the request deadline. I verified lock p99 below 20 ms, B p99 below 180 ms, zero timeouts, and correct reservation reconciliation.
 
 ---
 
-# 6. Question 5 - Intermittent Timeouts
+# Incident 5: Intermittency Exposes Stale DNS
 
 ## Interview question
 
-> Service A to Service B works sometimes but times out sometimes. How would you investigate?
+> Service A → Service B works sometimes but times out sometimes. How would you investigate?
 
-## Why intermittent failures are different
+## The page arrives
 
-A complete outage tells you the path is consistently broken. An intermittent outage proves that at least one combination of source, destination, request, time, or dependency works. The investigation should therefore find the dimension that differs between success and failure.
+At 13:08 UTC on 2026-09-13, intermittency exposes stale DNS.
+The first failed request is `ord-d50bc4`, trace `05f92f3577b34da6a3ce929d0e0e0005`, from `order-a-4.18.2-p8t6d` toward `10.42.18.37:8080` and target label `inventory-b-retired`.
+The measured scope is 32-35% of all A calls, clustered on one of three answers and new connections.
+The first metric sentence is: two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
 
-Think in a matrix:
+## What I do in the first five minutes
+
+### Minute 0-1: make the symptom exact
+
+I write `13:08 UTC | request=ord-d50bc4 | source=order-a-4.18.2-p8t6d | target=10.42.18.37:8080 | scope=32-35% of all A calls, clustered on one of three answers and new connections`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
+
+### Minute 1-2: define the blast radius
+
+I split the dataset until I can state: 32-35% of all A calls, clustered on one of three answers and new connections.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
+
+### Minute 2-3: open the exact dashboard
+
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `service discovery target lifecycle`, but it remains a hypothesis.
+
+### Minute 3-4: count across boundaries
+
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
+
+### Minute 4-5: preserve evidence
+
+I save trace `05f92f3577b34da6a3ce929d0e0e0005`, sanitized logs for `ord-d50bc4`, target `inventory-b-retired`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
+
+## Metric-by-metric causal walk
+
+### Compare successful and failed populations first
+
+At 13:08 UTC the same route and payload sometimes succeed in about 100 ms and sometimes wait three seconds. I create two datasets rather than averaging them. Failures are 32-35% across A instances and versions, close to one of three DNS answers; successes use `10.42.7.18` or `.19`, while failures begin with `10.42.18.37`.
+
+Business success is partly masked by retry: original orders remain 210/s, but Inventory attempts rise to 286/s, or 1.36 attempts per order. First-attempt success falls much farther than final success. That retry amplification loads the two healthy targets and consumes most of the deadline.
+
+### DNS answer, connection age, and TCP result
+
+DNS returns three addresses with `NOERROR` and normal 4 ms p99, so this is not a resolution failure. Correctness is the issue: the retired `.37` answer remains advertised. I retain answer order, TTL, selected IP, and cache age on every request.
+
+New connections to `.18` and `.19` complete in 7-10 ms. New connections to `.37` retransmit and end at the three-second connect timeout. No refusal means no reachable closed listener. If every address timed out from one zone, I would inspect its route; the per-answer split selects discovery lifecycle.
+
+Reused connections initially show fewer failures because pools already hold healthy `.18` and `.19` sockets. As those age out, failures approach one third. The opposite pattern - new connections succeeding while old ones reset - would point to stale keep-alive or draining instead. I keep that branch explicit because it becomes the mechanism in Incident 14.
+
+### Gateway, targets, retries, and downstream controls
+
+The gateway target inventory contains only the two current B instances, but A's direct discovery cache still includes `.37`. B server rate on `.18` and `.19` rises because of second attempts; there is no B span or access log for `.37`. Healthy-target count at the gateway therefore cannot validate A's separate discovery source.
+
+Attempt 1 to `.37` consumes 3.000 s; attempt 2 to `.18` succeeds in 96 ms when enough deadline remains. Circuit breakers differ by A instance because each sees a local sample, so some open later than others. I cap retry amplification within the existing budget while removing the stale answer; I do not add retries.
+
+B CPU rises modestly from 36% to 51% due to retries, but queues, GC, DB pool, and dependency latency remain healthy. That downstream headroom makes the temporary traffic distribution safe. Had B queue or pool pending climbed, I would reduce retries immediately and shed noncritical work.
+
+Discovery audit logs show that retired VM B-legacy-4 was terminated at 12:56:11 after deregistration failed. Repeated bounded resolution produces `.18 OK 94 ms`, `.19 OK 101 ms`, and `.37 CONNECT_TIMEOUT 3000 ms`. Removing `.37` changes first-attempt success and attempts/order in the predicted direction.
+
+## Trace: follow parent to the failing child
+
+I search trace `05f92f3577b34da6a3ce929d0e0e0005` and start at the A server parent.
+The failed waterfall reads `attempt1 target .37 3s ERROR -> attempt2 target .18 96ms OK`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-d50bc4`, `source=order-a-4.18.2-p8t6d`, `backend=inventory-b-retired`, and `server.address=10.42.18.37:8080` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `attempt=1 resolved_ip=10.42.18.37 connect_timeout`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
 
 ```text
-source A instance
-destination B instance
-node / zone / region
-resolved IP
-endpoint / method
-tenant / record / payload
-time / traffic level
-connection reused or new
-dependency selected
-software/config version
+2026-09-13T13:08:22.417Z level=ERROR request_id=ord-d50bc4 trace_id=05f92f3577b34da6a3ce929d0e0e0005
+source_instance=order-a-4.18.2-p8t6d backend=inventory-b-retired target=10.42.18.37:8080
+message="attempt=1 resolved_ip=10.42.18.37 connect_timeout"
 ```
 
-## Detailed causes
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
 
-| Pattern | Common cause |
-|---|---|
-| Failure rate is close to `1 / number of backends` | One bad Service B instance |
-| Failures occur only on one Service A pod/node | Source-side DNS, route, proxy, certificate, node, NAT, or config issue |
-| Failures occur during traffic peaks | Thread/pool/CPU/DB capacity exhaustion |
-| Failures occur at regular intervals | GC, scheduled job, cache refresh, connection eviction, certificate task |
-| Failures follow deployment/scaling | Startup readiness, draining, mixed versions, cold cache |
-| Failures affect certain tenants or records | Data-specific query, lock, code path, payload size |
-| Failures affect new connections only | NAT/conntrack/SYN backlog/TLS handshake capacity |
-| Failures affect reused connections only | Stale keep-alive connection or mismatched idle timeouts |
-| Failures map to one DNS answer | Stale or unhealthy address in a multi-record response |
-| Failures occur after retry bursts | Retry amplification and cascading saturation |
-| Failures occur in one zone | Network path, node, zone-local dependency, or uneven routing |
-| Failures occur on cache misses | Slow DB or downstream path hidden by cache hits |
+## Safe config, runtime, network, and direct-path test
 
-Other causes include:
-
-- Uneven load-balancer weights or sticky sessions.
-- Connection-pool exhaustion under bursts.
-- Thread-pool queue spikes.
-- DB lock contention or plan changes for particular parameters.
-- Periodic long GC pauses.
-- External provider variability.
-- Autoscaling that reacts too slowly.
-- DNS TTL/cache differences between instances.
-- Rolling deployment with old and new versions.
-- Packet loss or flaky network interface.
-- Service-mesh sidecar resource starvation.
-
-## Step-by-step debugging
-
-### Step 1 - Quantify instead of sampling one failure
-
-Measure:
-
-- Requests and failures per minute.
-- Timeout rate and latency percentiles.
-- Start/end time.
-- Burst or continuous pattern.
-- Affected percentage.
-- Retry attempts and final failures.
-
-An average latency graph is insufficient. Inspect p95/p99/max and timeout count.
-
-### Step 2 - Build success and failure datasets
-
-For a representative time window, collect:
+The exact next test is to correlate repeated bounded answers with outcome and attempt.
+I run one or a few bounded probes from A's real execution context and one matched control.
 
 ```text
-timestamp
-request/trace ID
-source instance/node/zone
-resolved destination IP
-destination instance/node/zone
-endpoint/method
-tenant or safe data category
-payload/response size
-status or exception
-connect duration
-time to first byte
-total duration
-retry attempt
+FAIL request=ord-d50bc4 source=order-a-4.18.2-p8t6d target=10.42.18.37:8080
+RESULT .18 OK 94ms; .19 OK 101ms; .37 TIMEOUT 3000ms
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
 ```
 
-Do not log sensitive payload contents merely to diagnose latency.
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
 
-### Step 3 - Group failures by dimension
+### Result branches
 
-Examples:
+| Test result | Interpretation | Next evidence |
+|---|---|---|
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
 
-```text
-failure rate by destination instance
-failure rate by source instance
-failure rate by endpoint
-failure rate by zone
-failure rate by five-minute interval
-failure rate by payload-size bucket
-```
+## Alternate branches kept alive
 
-The strongest correlation determines the next investigation. Avoid changing all instances before identifying whether one is different.
+The symptom can have several causes; I reject each only with boundary evidence.
 
-### Step 4 - Test the one-bad-instance hypothesis
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
 
-Inspect load-balancer access logs, trace attributes, response headers, or application logs for backend identity. Compare direct, approved tests to each backend while preserving required `Host` and TLS SNI values.
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
 
-If one instance is bad:
+## Fully worked causal chain
 
-1. Drain it from traffic to protect users.
-2. Preserve logs, metrics, runtime state, and configuration before replacing it when safe.
-3. Compare it with a healthy instance.
-4. Find why it became different.
+1. At 13:08 UTC the triggering production state changed.
+2. discovery retained a retired VM IP after failed deregistration.
+3. Mechanically, one-third random selection hit a dead subnet and retries loaded healthy targets.
+4. Therefore `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s`.
+5. Trace `05f92f3577b34da6a3ce929d0e0e0005` showed `attempt1 target .37 3s ERROR -> attempt2 target .18 96ms OK`.
+6. It selected log evidence `attempt=1 resolved_ip=10.42.18.37 connect_timeout`.
+7. The safe failed/control comparison showed `.18 OK 94ms; .19 OK 101ms; .37 TIMEOUT 3000ms`.
+8. That explains the customer scope: 32-35% of all A calls, clustered on one of three answers and new connections.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
 
-### Step 5 - Correlate with saturation
+## Mitigation is not root cause
 
-Overlay timeout rate with:
+**Mitigation:** I remove stale discovery address and cap retry amplification.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
 
-- Request rate and concurrency.
-- Worker queue and active threads.
-- DB and HTTP pool pending counts.
-- CPU throttling.
-- GC pauses.
-- DB latency/locks/connections.
-- NAT/SNAT and conntrack use.
-- Load balancer active/new/rejected connections.
-- Downstream latency and error rate.
+**Root cause:** discovery retained a retired VM IP after failed deregistration.
+It lives at `service discovery target lifecycle` and explains why one-third random selection hit a dead subnet and retries loaded healthy targets.
+A workaround that clears current state does not correct this mechanism.
 
-Temporal alignment is essential. Current healthy metrics do not explain a spike from 30 minutes earlier.
+## Permanent correction
 
-### Step 6 - Check DNS and endpoint rotation
+The primary fix is to make deregistration/draining transactional and reconcile answers to targets.
+I apply only controls supported by the incident evidence:
 
-Record all answers and test each IP. Check:
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
 
-- Multi-A/AAAA record contains a bad destination.
-- Clients cache answers for different durations.
-- A stale record survived deployment.
-- Headless Kubernetes service returns an unready pod.
-- Service discovery registration/deregistration is delayed.
+## Verification of recovery
 
-### Step 7 - Check connection reuse
+The incident-specific target is: all advertised targets healthy and attempts/request 1.00.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
 
-Compare:
+## Recurrence prevention
 
-- Forced new connection versus normal keep-alive.
-- Idle age of failed connections.
-- Client pool idle timeout.
-- Gateway/load-balancer idle timeout.
-- Server keep-alive timeout.
-
-If an intermediary closes idle connections before the client evicts them, the client can occasionally reuse a stale socket. Align idle settings or validate connections before reuse according to the client library's supported mechanisms.
-
-### Step 8 - Check retry behavior
-
-Find whether one user request creates multiple backend attempts. Verify:
-
-- Only idempotent operations are retried unless protected by an idempotency key.
-- Retries are bounded.
-- Backoff includes jitter.
-- Retry budget is below the overall deadline.
-- Multiple layers are not each retrying.
-
-Retries may hide the first failures while multiplying load until the service collapses.
-
-### Step 9 - Reproduce safely
-
-Use production-safe, rate-limited diagnostics or reproduce in a representative nonproduction environment. Do not generate uncontrolled load during an incident. A test must retain the suspected variables: instance, network path, headers, payload size, auth identity, and cache state.
-
-### Step 10 - Fix, monitor, and prevent
-
-The fix depends on the proven dimension:
-
-- Remove configuration/version drift.
-- Correct load-balancer health/draining.
-- Fix query, dependency, pool, or resource bottleneck.
-- Correct DNS/discovery lifecycle.
-- Align keep-alive/idle timeouts.
-- Repair a node/zone network issue.
-- Add backpressure, deadline propagation, and safe retry policy.
-- Improve autoscaling using a leading saturation signal rather than CPU alone.
-
-Verify the failure distribution becomes zero or returns to the accepted baseline across all dimensions, not only in aggregate.
+I alert on business SLO plus `two targets <120ms; 10.42.18.37 times out at 3s; retries amplify 210 to 286 attempts/s` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
 
 ## Interview-ready answer
 
-> Because some requests succeed, I would compare successful and failed requests rather than treat B as globally down. I would collect request ID, timestamp, source and destination instance, node and zone, resolved IP, endpoint, payload-size category, latency phase, and retry attempt. I would group failures by each dimension and correlate them with traffic, queues, pools, CPU throttling, GC, database and downstream latency, DNS answers, and load-balancer targets. I would specifically test for one bad backend, one bad source node, peak-load saturation, stale keep-alive connections, DNS rotation, and retry amplification. I would drain an unhealthy instance if needed, preserve evidence, fix the actual difference, and verify every instance and traffic period.
+> For an intermittent timeout, I compare matched successes and failures rather than averaging them. Here failures were 32-35%, which suggested one of three addresses. DNS latency was normal, but every failed first attempt selected the stale address `10.42.18.37` and timed out after three seconds; the two current addresses connected in under 10 ms. Retries hid some customer failures while increasing backend attempts from 210 to 286 per second. Discovery logs showed that a retired VM had not deregistered. I removed that address and bounded retries as mitigation. The permanent fix made draining and deregistration transactional and added reconciliation between advertised answers and live targets. I verified every answer, first-attempt success above 99.9%, attempts per order back to 1.00, and stable capacity on both healthy targets.
 
 ---
 
-# 7. Question 6 - Service B Is Running, but Service A Cannot Reach It
+# Incident 6: Running Pods Hide a Selector Error
 
 ## Interview question
 
 > Service B is running, but Service A cannot reach it. What would you check?
 
-## "Running" is not the same as "reachable"
+## The page arrives
 
-These are separate states:
+At 14:16 UTC on 2026-09-13, running pods hide a selector error.
+The first failed request is `ord-e003f7`, trace `06f92f3577b34da6a3ce929d0e0e0006`, from `order-a-4.18.2-k2m5q` toward `inventory-b.shop.svc:8080` and target label `inventory-b-r8x2p`.
+The measured scope is all Service calls; direct pod-IP probes succeed.
+The first metric sentence is: EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
 
-```text
-Process exists
-    -> application initialized
-    -> server socket listens
-    -> correct interface and port
-    -> instance is ready
-    -> service discovery includes it
-    -> network path permits A
-    -> proxy/load balancer routes to it
-    -> TLS succeeds
-    -> HTTP route accepts the request
-```
+## What I do in the first five minutes
 
-A container may be `Running` while the application is in a crash loop, blocked during startup, listening only on loopback, not ready, or exposed through an incorrectly configured service.
+### Minute 0-1: make the symptom exact
 
-## Detailed causes by location
+I write `14:16 UTC | request=ord-e003f7 | source=order-a-4.18.2-k2m5q | target=inventory-b.shop.svc:8080 | scope=all Service calls; direct pod-IP probes succeed`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
 
-### On Service B
+### Minute 1-2: define the blast radius
 
-- Process exists but HTTP server failed to start.
-- Server listens on a different port.
-- Server binds to `127.0.0.1`.
-- Server listens only on IPv6 while the path uses IPv4, or the reverse.
-- Local firewall blocks remote traffic.
-- Application is alive but not ready.
-- Host is resource-starved and does not accept promptly.
+I split the dataset until I can state: all Service calls; direct pod-IP probes succeed.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
 
-### In containers or Kubernetes
+### Minute 2-3: open the exact dashboard
 
-- Container port is not published.
-- Kubernetes Service selector does not match pod labels.
-- Service `targetPort` does not match the application listener.
-- No ready EndpointSlices exist.
-- Pod IP is stale in discovery.
-- NetworkPolicy denies ingress or Service A egress.
-- Sidecar interception/mTLS policy rejects the path.
-- Service exists in another namespace and the short name resolves incorrectly.
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `Kubernetes Service selection`, but it remains a hypothesis.
 
-### In the network or intermediary
+### Minute 3-4: count across boundaries
 
-- Wrong DNS record or environment.
-- Wrong route, subnet, peering, VPN, or private endpoint.
-- Firewall, security group, or ACL blocks the port.
-- Load balancer listener or backend pool is wrong.
-- Health check marks the backend unavailable.
-- Proxy is required but Service A bypasses it, or internal traffic is incorrectly sent through it.
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
 
-## Step-by-step debugging
+### Minute 4-5: preserve evidence
 
-### Step 1 - Define what "running" evidence exists
+I save trace `06f92f3577b34da6a3ce929d0e0e0006`, sanitized logs for `ord-e003f7`, target `inventory-b-r8x2p`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
 
-Ask whether "running" means:
+## Metric-by-metric causal walk
 
-- OS process is visible.
-- Container state is running.
-- Startup completed.
-- Port is listening.
-- Liveness passed.
-- Readiness passed.
-- Real business endpoint succeeded locally.
+### Running is only the first observation
 
-Do not accept one of these as proof of the others.
+At 14:16 UTC A's business success through `inventory-b.shop.svc` falls to zero, but `kubectl get pods` reports three B pods as Running. Running means the containers exist; it does not prove readiness, Service selection, listening, or reachability. Direct pod-IP business probes succeed in 112-126 ms, so the B process and handler can work.
 
-### Step 2 - Test locally on B
+A request rate is unchanged. Its client receives an immediate mesh 503 in 3 ms rather than a DNS, connect, or read timeout. The short duration says no business execution occurred. I use the mesh response flag, `UH`, to identify `no_healthy_upstream` rather than treating all 503 responses alike.
 
-Check the listener:
+### DNS, Service, and endpoint counts
 
-```bash
-ss -lntp | grep ':8080'
-curl -v --connect-timeout 2 --max-time 10 http://127.0.0.1:8080/health
-curl -v --connect-timeout 2 --max-time 10 http://<b-host-ip>:8080/health
-```
+Cluster DNS resolves `inventory-b.shop.svc` to the stable ClusterIP in 2 ms with no errors. That proves only the Service name exists. TCP to the virtual address reaches the sidecar path; there is no individual B connection attempt because the mesh cluster has zero eligible endpoints.
 
-Interpretation:
+The decisive gauge is EndpointSlice ready-address count: it drops from three to zero at 14:14:29. B pod readiness itself remains true. If pod readiness had fallen, I would inspect its configured probe and runtime. Ready pods plus an empty EndpointSlice instead points to selection or publication.
 
-- Loopback works, host IP fails: bind address or host firewall.
-- Both fail: listener/application problem.
-- Both work: move outward to service exposure and network path.
+I compare the Service selector `app=inventory` with actual labels `app=inventory-api`. No pod matches. Target port 8080 agrees with the listener, so a port mismatch is rejected. If EndpointSlice contained addresses but the mesh healthy count were zero, I would inspect mesh discovery or health; here both lose endpoints together.
 
-### Step 3 - Test from progressively closer locations
+### Downstream metrics stay flat for a reason
 
-Use a hop-by-hop approach:
+There are no B server spans or access logs for Service-routed failures, while direct control calls produce both. B CPU is 31%, queue zero, threads available, heap 55%, and HTTP/DB pools have idle capacity. DB, cache, and Pricing C rates fall only because routed traffic never arrives. Increasing B replicas would create more pods with labels that still do not match.
 
-```text
-B local loopback
-B host/pod IP
-another pod/host in B's subnet or namespace
-Service A pod/host
-gateway/load balancer path
-```
+Connection and retry panels confirm immediate rejection: no upstream socket is created, retries stay at one, and the circuit breaker is not the generator. The mesh refuses because its cluster membership is empty.
 
-The first boundary where the test changes from success to failure identifies the likely fault domain.
+Read-only manifest comparison shows the label changed in B revision 772 while the Service selector did not. Restoring a matching, stable label repopulates EndpointSlice with three ready addresses. I also check that the corrected selector does not accidentally include unrelated pods before restoring traffic.
 
-### Step 4 - Validate effective Service A configuration
+## Trace: follow parent to the failing child
 
-Confirm Service A uses the correct:
+I search trace `06f92f3577b34da6a3ce929d0e0e0006` and start at the A server parent.
+The failed waterfall reads `A 14ms -> sidecar 3ms ERROR no_healthy_upstream; no B span`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-e003f7`, `source=order-a-4.18.2-k2m5q`, `backend=inventory-b-r8x2p`, and `server.address=inventory-b.shop.svc:8080` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
 
-- Environment.
-- Hostname/FQDN.
-- Namespace.
-- Port.
-- Scheme.
-- Base path.
-- Proxy bypass.
-- TLS trust and client identity.
+## Trace-selected logs
 
-### Step 5 - Validate Kubernetes service wiring
-
-```bash
-kubectl get service -n <namespace> service-b -o yaml
-kubectl get endpointslice -n <namespace> -l kubernetes.io/service-name=service-b -o wide
-kubectl get pods -n <namespace> -l app=service-b --show-labels
-```
-
-Trace:
+The trace selects the narrow log evidence `response_flags=UH endpoints=0`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
 
 ```text
-DNS name
-  -> Service ClusterIP and port
-  -> selector
-  -> ready EndpointSlice addresses and target ports
-  -> pod IP
-  -> actual process listener
+2026-09-13T14:16:22.417Z level=ERROR request_id=ord-e003f7 trace_id=06f92f3577b34da6a3ce929d0e0e0006
+source_instance=order-a-4.18.2-k2m5q backend=inventory-b-r8x2p target=inventory-b.shop.svc:8080
+message="response_flags=UH endpoints=0"
 ```
 
-### Step 6 - Validate network permissions in both directions
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
 
-Check routes, security groups, ACLs, NetworkPolicies, mesh policies, and host firewalls using the real source and destination identities. A broad test from an administrator workstation may bypass the restriction affecting Service A.
+## Safe config, runtime, network, and direct-path test
 
-### Step 7 - Validate TLS and HTTP
+The exact next test is to compare Service selector, pod labels, and EndpointSlice.
+I run one or a few bounded probes from A's real execution context and one matched control.
 
-If TCP succeeds, stop saying "cannot reach." State the later failure precisely:
+```text
+FAIL request=ord-e003f7 source=order-a-4.18.2-k2m5q target=inventory-b.shop.svc:8080
+RESULT selector app=inventory; pods app=inventory-api; endpoints none
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
+```
 
-- TLS certificate failure.
-- mTLS client identity failure.
-- 401/403 authorization.
-- 404 route mismatch.
-- 500 business failure.
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
 
-### Step 8 - Correct and prevent
+### Result branches
 
-Typical fixes:
+| Test result | Interpretation | Next evidence |
+|---|---|---|
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
 
-- Make startup fail visibly if the server cannot bind.
-- Configure correct bind address and port.
-- Correct container/service/load-balancer mapping.
-- Make readiness represent traffic acceptance.
-- Use graceful startup/shutdown and endpoint draining.
-- Correct network and mesh policy.
-- Add an end-to-end synthetic check from Service A's network zone.
+## Alternate branches kept alive
+
+The symptom can have several causes; I reject each only with boundary evidence.
+
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
+
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
+
+## Fully worked causal chain
+
+1. At 14:16 UTC the triggering production state changed.
+2. B pods changed app=inventory to app=inventory-api while Service selector stayed app=inventory.
+3. Mechanically, running listeners were not published as Service endpoints.
+4. Therefore `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream`.
+5. Trace `06f92f3577b34da6a3ce929d0e0e0006` showed `A 14ms -> sidecar 3ms ERROR no_healthy_upstream; no B span`.
+6. It selected log evidence `response_flags=UH endpoints=0`.
+7. The safe failed/control comparison showed `selector app=inventory; pods app=inventory-api; endpoints none`.
+8. That explains the customer scope: all Service calls; direct pod-IP probes succeed.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
+
+## Mitigation is not root cause
+
+**Mitigation:** I restore label or correct selector after checking unintended matches.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
+
+**Root cause:** B pods changed app=inventory to app=inventory-api while Service selector stayed app=inventory.
+It lives at `Kubernetes Service selection` and explains why running listeners were not published as Service endpoints.
+A workaround that clears current state does not correct this mechanism.
+
+## Permanent correction
+
+The primary fix is to render-test selectors and block zero-endpoint deployments.
+I apply only controls supported by the incident evidence:
+
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
+
+## Verification of recovery
+
+The incident-specific target is: three ready addresses and balanced business calls.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
+
+## Recurrence prevention
+
+I alert on business SLO plus `EndpointSlice ready addresses fall 3 to 0; sidecar returns no healthy upstream` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
 
 ## Interview-ready answer
 
-> I would challenge what "running" means. A process or running container does not prove that the application initialized, listens on the expected interface and port, is ready, is registered, or is reachable from A. I would test B locally on loopback and its host or pod IP, verify the socket and bind address, then test progressively from the same subnet and finally from A. In Kubernetes I would trace DNS to Service port, selector, EndpointSlice, pod IP, and actual listener, and inspect ingress and egress policies and sidecars. Once TCP succeeds I would classify any TLS or HTTP failure separately. The first boundary where success changes to failure identifies the owning layer.
+> I would not equate "Running" with reachable. At 14:16 UTC, all Service-routed Inventory calls failed immediately, while direct pod-IP calls succeeded. DNS resolved the Service normally, but the mesh returned `UH`, meaning no healthy upstream, and EndpointSlice ready addresses had fallen from three to zero. Comparing the Service selector with pod labels showed that deployment revision 772 changed `app=inventory` to `app=inventory-api`. B's CPU, queues, pools, and dependencies were normal because routed requests never arrived. I restored the matching label as mitigation after checking for unintended selector matches. The permanent fix used immutable labels, rendered-manifest selector tests, and a deployment gate for zero endpoints. I verified three ready addresses, balanced calls to every pod, zero mesh errors, and successful reservations.
 
 ---
 
-# 8. Question 7 - Ping Works, but the API Call Fails
+# Incident 7: Ping Success Stops Before HTTPS
 
 ## Interview question
 
-> Service A can ping Service B's server, but the API call fails. Why, and how would you troubleshoot it?
+> Service A can ping Service B's server, but the API call fails. Why?
 
-## What ping proves
+## The page arrives
 
-`ping` normally uses ICMP echo. An API normally uses DNS, TCP, optionally TLS, and HTTP.
+At 15:05 UTC on 2026-09-13, ping success stops before HTTPS.
+The first failed request is `ord-f82c11`, trace `07f92f3577b34da6a3ce929d0e0e0007`, from `order-a-vm-12` toward `10.42.7.18:8443` and target label `inventory-b-vm-04`.
+The measured scope is ICMP from A node works; TCP 8443 across subnet fails.
+The first metric sentence is: ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
+
+## What I do in the first five minutes
+
+### Minute 0-1: make the symptom exact
+
+I write `15:05 UTC | request=ord-f82c11 | source=order-a-vm-12 | target=10.42.7.18:8443 | scope=ICMP from A node works; TCP 8443 across subnet fails`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
+
+### Minute 1-2: define the blast radius
+
+I split the dataset until I can state: ICMP from A node works; TCP 8443 across subnet fails.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
+
+### Minute 2-3: open the exact dashboard
+
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `L3/L4 firewall`, but it remains a hypothesis.
+
+### Minute 3-4: count across boundaries
+
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
+
+### Minute 4-5: preserve evidence
+
+I save trace `07f92f3577b34da6a3ce929d0e0e0007`, sanitized logs for `ord-f82c11`, target `inventory-b-vm-04`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
+
+## Metric-by-metric causal walk
+
+### Separate ICMP from the application protocol
+
+At 15:05 UTC `ping 10.42.7.18` returns in 1 ms with zero loss, but every API call from A's subnet times out. ICMP echo proves that one host answered one protocol. The API requires TCP 8443, then TLS, HTTP routing, authentication, and B execution; ping exercises none of those later stages.
+
+Order demand remains normal, and A records 100% connect timeouts at exactly five seconds. DNS is not involved in the direct-IP reproduction, which removes name resolution from this test. A successful ping alongside a failed TCP connect is therefore entirely consistent.
+
+### TCP evidence identifies the policy boundary
+
+`Test-NetConnection` from `order-a-vm-12` reports `TcpTestSucceeded=False`. SYN retransmissions rise on A, B records no accepted sockets, and there are no resets. A closed port would normally refuse quickly; retransmission until deadline indicates silent drop or a path that cannot return SYN-ACK.
+
+The failure follows source subnet `10.41.12.0/24` to destination port 8443 across both B instances. It does not follow one A host, B target, node, or DNS answer. That scope favors a shared route, ACL, security group, or firewall rule.
+
+TLS has zero samples for failures, gateway upstream attempts are absent on the direct path, and B HTTP rate is flat. B health, CPU, worker queue, memory, GC, HTTP/DB pools, and DB/cache/C metrics remain normal. Those controls prevent an expensive detour into application code.
+
+### Read-only flow evidence and branches
+
+Firewall flow logs for the exact tuple show `src=10.41.12.24 dst=10.42.7.18 proto=TCP dstport=8443 action=DENY`. ICMP records show `ALLOW`. Policy revision `fw-2041` began at 15:01:06 and omitted the TCP rule.
+
+If flow logs showed ALLOW but B saw no SYN, I would inspect routing and intermediate devices. If B saw SYN and sent SYN-ACK, I would inspect the reverse path. If TCP succeeded and TLS failed, I would move to SNI, trust, and mTLS. The DENY record selects the firewall branch directly.
+
+Retries remain disabled, which avoids turning each user request into repeated five-second waits. Adding replicas or increasing the timeout would not alter the rule. I apply the approved least-privilege tuple and then verify TCP, TLS, authenticated HTTP, and business outcome in sequence.
+
+## Trace: follow parent to the failing child
+
+I search trace `07f92f3577b34da6a3ce929d0e0e0007` and start at the A server parent.
+The failed waterfall reads `A 5.004s -> TCP connect 5s ERROR; no TLS/B span`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-f82c11`, `source=order-a-vm-12`, `backend=inventory-b-vm-04`, and `server.address=10.42.7.18:8443` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `connect timeout source=10.41.12.24`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
 
 ```text
-ICMP success != TCP port success != TLS success != HTTP/API success
+2026-09-13T15:05:22.417Z level=ERROR request_id=ord-f82c11 trace_id=07f92f3577b34da6a3ce929d0e0e0007
+source_instance=order-a-vm-12 backend=inventory-b-vm-04 target=10.42.7.18:8443
+message="connect timeout source=10.41.12.24"
 ```
 
-Ping can prove that one IP answers ICMP from one source. It does not prove:
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
 
-- The API port is open.
-- A process listens.
-- A firewall allows TCP.
-- TLS certificates are valid.
-- The correct virtual host is selected.
-- Authentication and authorization work.
-- The URL path exists.
-- Service B or its dependencies are healthy.
+## Safe config, runtime, network, and direct-path test
 
-Some environments block ICMP even when APIs work, so ping failure is also not conclusive.
-
-## Detailed causes
-
-- ICMP is allowed, but TCP port `8080` or `443` is blocked.
-- The server is reachable, but no process listens on the API port.
-- Service A uses the wrong port or protocol.
-- Service binds only to localhost.
-- DNS used by ping resolves a different address than the application uses or caches.
-- HTTPS is sent to an HTTP port, or HTTP is sent to a TLS port.
-- TLS hostname, trust, SNI, version, or mTLS fails.
-- Proxy or load balancer route is incorrect.
-- Required `Host` header or virtual-host mapping is missing.
-- API path, method, base path, or version is wrong.
-- Authentication token is absent, expired, wrong audience, or unauthorized.
-- Request content type or payload is invalid.
-- API responds with 500 due to application/dependency failure.
-- Response is slow and times out.
-
-## Step-by-step debugging
-
-### Step 1 - Record what ping actually tested
-
-Capture the hostname and IP shown by ping:
+The exact next test is to run TCP probe from A and inspect read-only flow logs.
+I run one or a few bounded probes from A's real execution context and one matched control.
 
 ```text
-Pinging service-b [10.20.4.18]
+FAIL request=ord-f82c11 source=order-a-vm-12 target=10.42.7.18:8443
+RESULT Ping 1ms; TcpTestSucceeded False; DENY dstport=8443
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
 ```
 
-Compare it with Service A's DNS result and application logs. A hostname can return multiple addresses, and the application may select another one.
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
 
-### Step 2 - Test the API's TCP port
+### Result branches
 
-```powershell
-Test-NetConnection service-b -Port 8080 -InformationLevel Detailed
-```
+| Test result | Interpretation | Next evidence |
+|---|---|---|
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
 
-```bash
-nc -vz -w 5 service-b 8080
-```
+## Alternate branches kept alive
 
-- TCP fails: investigate listener, port, route, firewall, or policy.
-- TCP succeeds: continue to TLS/HTTP; do not keep using ping as evidence.
+The symptom can have several causes; I reject each only with boundary evidence.
 
-### Step 3 - Test protocol and TLS
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
 
-```bash
-curl -v http://service-b:8080/health
-curl -v https://service-b:443/health
-```
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
 
-Use only the protocol the service is intended to expose. Errors such as "wrong version number" often indicate HTTPS was sent to a plain HTTP port or vice versa.
+## Fully worked causal chain
 
-For TLS:
+1. At 15:05 UTC the triggering production state changed.
+2. firewall fw-2041 allowed ICMP but omitted TCP 8443 from 10.41.12.0/24.
+3. Mechanically, different protocol matched default TCP drop despite ICMP success.
+4. Therefore `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero`.
+5. Trace `07f92f3577b34da6a3ce929d0e0e0007` showed `A 5.004s -> TCP connect 5s ERROR; no TLS/B span`.
+6. It selected log evidence `connect timeout source=10.41.12.24`.
+7. The safe failed/control comparison showed `Ping 1ms; TcpTestSucceeded False; DENY dstport=8443`.
+8. That explains the customer scope: ICMP from A node works; TCP 8443 across subnet fails.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
 
-```bash
-openssl s_client -connect service-b:443 -servername service-b -showcerts </dev/null
-```
+## Mitigation is not root cause
 
-### Step 4 - Test the real HTTP contract
+**Mitigation:** I apply approved least-privilege TCP rule.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
 
-Verify:
+**Root cause:** firewall fw-2041 allowed ICMP but omitted TCP 8443 from 10.41.12.0/24.
+It lives at `L3/L4 firewall` and explains why different protocol matched default TCP drop despite ICMP success.
+A workaround that clears current state does not correct this mechanism.
 
-- Method: GET, POST, PUT, and so on.
-- Full path and gateway prefix.
-- `Host` header/virtual host.
-- Content type and accept header.
-- Authentication token and scope.
-- Required correlation or tenant headers.
-- Payload schema and size.
+## Permanent correction
 
-Use safe credentials and do not expose tokens in command history or shared logs.
+The primary fix is to generate rules from service contracts and test TCP before closure.
+I apply only controls supported by the incident evidence:
 
-### Step 5 - Interpret the HTTP result
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
 
-| Result | Next area |
-|---|---|
-| No TCP connection | Network/listener/port |
-| TLS error | Certificate/trust/SNI/mTLS/protocol |
-| 400/415 | Request format/content type |
-| 401/403 | Authentication/authorization |
-| 404/405 | Path, route, version, or method |
-| 429 | Rate/concurrency policy |
-| 500 | Application or dependency |
-| 502/503/504 | Gateway and backend relationship |
-| Read timeout | Queue, application, dependency, response |
+## Verification of recovery
 
-### Step 6 - Compare command and application paths
+The incident-specific target is: TCP <10ms, TLS/API success, deny count 0 without broad access.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
 
-If `curl` succeeds but Service A fails, compare:
+## Recurrence prevention
 
-- URL after configuration substitution.
-- Proxy and `NO_PROXY`.
-- DNS cache.
-- Trust store and client certificate.
-- HTTP library protocol/version.
-- Connection pool.
-- Headers and payload.
-- Timeout and retry policy.
-- Service-mesh interception.
+I alert on business SLO plus `ping loss 0% at 1ms; TCP timeout 100% at 5s; B accepts zero` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
 
 ## Interview-ready answer
 
-> Ping only tests ICMP reachability to an IP; it does not test the API's TCP port, TLS, HTTP route, identity, or application. I would compare the IP that ping used with Service A's actual DNS result, then test the exact TCP port from Service A. If TCP succeeds, I would test TLS with the correct SNI and then the real HTTP method, path, headers, authentication, and payload. I would use the resulting status or exception to move to the correct layer. A 401, 404, or 500 proves much more HTTP progress than ping does.
+> I would explain that ping tests ICMP, not the API's TCP, TLS, or HTTP path. In this case ICMP completed in 1 ms, but A's TCP 8443 attempts retransmitted until the five-second connect deadline, and B accepted no sockets. The failure followed the Order subnet rather than an instance or target. Read-only firewall logs showed ICMP allowed but TCP 8443 denied after revision `fw-2041`. I applied the approved least-privilege rule for the exact source CIDR, destination, protocol, and port. The durable fix generated network rules from service contracts and added caller-context TCP tests to change validation. I verified a sub-10-ms handshake, successful TLS and authenticated API calls, zero matching denies, and restored reservation success without broadening access.
 
 ---
 
-# 9. Question 8 - DNS Resolution Is Failing
+# Incident 8: DNS SERVFAIL Finds a Forwarder
 
 ## Interview question
 
 > DNS resolution for Service B is failing. How would you troubleshoot it?
 
-## DNS failure types
+## The page arrives
 
-Do not group every DNS problem under `UnknownHostException`.
+At 16:22 UTC on 2026-09-13, DNS SERVFAIL identifies a failed forwarder.
+The first failed request is `ord-01a849`, trace `08f92f3577b34da6a3ce929d0e0e0008`, from `order-a-4.18.2-k2m5q` toward `inventory-b.corp:443` and target label `inventory-b.corp`.
+The measured scope is inventory.corp names fail cluster-wide; public and .svc names work.
+The first metric sentence is: SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
 
-| DNS result | Meaning |
-|---|---|
-| `NXDOMAIN` | The queried name is reported not to exist |
-| `NOERROR` with no useful answer | Name may exist but requested record type is absent |
-| `SERVFAIL` | Resolver could not complete the lookup, often due to upstream, DNSSEC, or server failure |
-| Query timeout | Resolver was unreachable, overloaded, or DNS traffic was blocked/dropped |
-| Correct query returns wrong/stale IP | Record, cache, split-horizon view, or registration is wrong |
-| Some queries work, some fail | Multiple resolvers, packet loss, load, truncation/TCP fallback, or per-node issue |
-| Short name fails, FQDN works | Search suffix, namespace, or `ndots` behavior |
+## What I do in the first five minutes
 
-## Where DNS can fail
+### Minute 0-1: make the symptom exact
+
+I write `16:22 UTC | request=ord-01a849 | source=order-a-4.18.2-k2m5q | target=inventory-b.corp:443 | scope=inventory.corp names fail cluster-wide; public and .svc names work`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
+
+### Minute 1-2: define the blast radius
+
+I split the dataset until I can state: inventory.corp names fail cluster-wide; public and .svc names work.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
+
+### Minute 2-3: open the exact dashboard
+
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `cluster resolver forwarding`, but it remains a hypothesis.
+
+### Minute 3-4: count across boundaries
+
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
+
+### Minute 4-5: preserve evidence
+
+I save trace `08f92f3577b34da6a3ce929d0e0e0008`, sanitized logs for `ord-01a849`, target `inventory-b.corp`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
+
+## Metric-by-metric causal walk
+
+### Stop before TCP when resolution fails
+
+At 16:22 UTC A's Inventory client rate becomes 100% name-resolution failure. No resolved address is attached to the failed requests, and TCP attempt count falls to zero. That ordering matters: a firewall at B cannot explain a request that never obtained a destination.
+
+The DNS histogram rises from 4 ms p99 to 2.0 seconds, and the response code is `SERVFAIL`, not `NXDOMAIN`. NXDOMAIN would say the queried name does not exist in that view; SERVFAIL says the resolver could not complete resolution. Negative-cache and retry counters show two attempts inside each A request.
+
+### Compare zones through the same resolver
+
+From the affected pod, `inventory-b.corp` returns SERVFAIL after 2,001 ms. `kubernetes.default.svc` returns NOERROR in 3 ms, and a public control name returns in 11 ms. CoreDNS itself is accepting queries, so a total resolver outage is unlikely. Only the conditional zone `inventory.corp` fails.
+
+The answer is identical across A instances, versions, nodes, and zones, which rejects one runtime cache or node-local resolver. If only one A process failed while `dig` succeeded, I would inspect JVM/.NET caching and search domains. If the result were NXDOMAIN everywhere, I would inspect the record and authoritative zone instead.
+
+CoreDNS metrics show forwarding latency at the two-second timeout and errors only for upstream `10.40.0.53`. Its general CPU, memory, request queue, and cache hit ratio are normal. A route lookup and read-only network telemetry show that the conditional forwarder's address became unreachable after route-table revision `rt-corp-17`.
+
+### Confirm that later layers are absent
+
+A HTTP pool has idle connections but creates no new B connection because resolution fails. TCP, TLS, gateway upstream, target-health, B server, B runtime, pools, and dependencies have no failed-request samples. Their unchanged state is expected and does not weaken the DNS diagnosis.
+
+Retrying DNS at the application level would multiply resolver traffic and consume the order deadline. The circuit breaker opens for name-resolution failure on some A instances, but that is a protective consequence, not the root cause.
+
+Restoring the approved route makes `inventory-b.corp` return its expected private addresses in 7 ms. I verify TTL and answer ownership, then let normal TCP/TLS/API checks prove the later stages. Redundant forwarders and per-zone probes prevent a single conditional path from silently removing the service.
+
+## Trace: follow parent to the failing child
+
+I search trace `08f92f3577b34da6a3ce929d0e0e0008` and start at the A server parent.
+The failed waterfall reads `A 2.01s -> dns.lookup 2s ERROR SERVFAIL; no TCP/TLS/B`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-01a849`, `source=order-a-4.18.2-k2m5q`, `backend=inventory-b.corp`, and `server.address=inventory-b.corp:443` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `UnknownHostException; server failure after 2 attempts`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
 
 ```text
-Application DNS cache
-  -> OS resolver/cache
-  -> container resolver configuration
-  -> node-local DNS cache
-  -> cluster/corporate recursive resolver
-  -> authoritative DNS or service discovery
+2026-09-13T16:22:22.417Z level=ERROR request_id=ord-01a849 trace_id=08f92f3577b34da6a3ce929d0e0e0008
+source_instance=order-a-4.18.2-k2m5q backend=inventory-b.corp target=inventory-b.corp:443
+message="UnknownHostException; server failure after 2 attempts"
 ```
 
-## Detailed causes
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
 
-- Typo or wrong environment/namespace in the hostname.
-- DNS record was never created or was deleted.
-- Service discovery registration is missing or stale.
-- Wrong record type: A, AAAA, CNAME, SRV, or private endpoint.
-- Incorrect `/etc/resolv.conf`, Windows DNS adapter, search suffix, or resolver order.
-- Kubernetes Service name or namespace is wrong.
-- CoreDNS or node-local DNS is unavailable, overloaded, throttled, or misconfigured.
-- UDP/TCP port 53 is blocked by firewall or NetworkPolicy.
-- DNS response is truncated and TCP fallback is blocked.
-- Split-horizon DNS gives different answers inside and outside the network.
-- Negative result is cached after a record was created.
-- Positive cache retains an old IP after backend replacement.
-- Application DNS cache ignores or extends TTL.
-- Multiple resolvers have inconsistent data.
-- Search-domain expansion queries an unintended name.
-- IPv6 AAAA is returned but the runtime cannot reach IPv6.
-- Too many search attempts or DNS queries cause delay.
-- Cloud private DNS zone is not linked to Service A's network.
-- Headless service exposes pod addresses that are stale or unready.
+## Safe config, runtime, network, and direct-path test
 
-## Step-by-step debugging
-
-### Step 1 - Capture the exact requested name
-
-Log or inspect the exact hostname after configuration is resolved:
+The exact next test is to query exact name plus public and .svc controls through A resolver.
+I run one or a few bounded probes from A's real execution context and one matched control.
 
 ```text
-service-b
-service-b.orders
-service-b.orders.svc.cluster.local
-service-b.prod.internal.example
+FAIL request=ord-01a849 source=order-a-4.18.2-k2m5q target=inventory-b.corp:443
+RESULT corp SERVFAIL 2001ms; .svc NOERROR 3ms
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
 ```
 
-Trailing dots, hidden whitespace, wrong case in non-DNS discovery systems, a URL accidentally passed as a hostname, or an unresolved variable such as `${SERVICE_B_HOST}` can all matter.
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
 
-### Step 2 - Query from the affected Service A instance
+### Result branches
 
-Windows:
-
-```powershell
-Resolve-DnsName service-b
-nslookup service-b
-Get-DnsClientServerAddress
-```
-
-Linux:
-
-```bash
-getent ahosts service-b
-dig service-b
-cat /etc/resolv.conf
-```
-
-`getent` is useful because it follows the host's normal name-service configuration, while `dig` directly tests DNS and may bypass hosts-file or other name-service sources.
-
-### Step 3 - Record resolver, response code, answer, TTL, and timing
-
-Check:
-
-- Which resolver answered?
-- Was it `NXDOMAIN`, `SERVFAIL`, timeout, or a wrong answer?
-- Which A and AAAA records were returned?
-- What are the TTLs?
-- Does querying the FQDN change the result?
-- Do repeated queries alternate between resolvers or answers?
-
-### Step 4 - Compare working and failing instances
-
-Compare:
-
-- Resolver addresses.
-- Search domains and `ndots`.
-- Hosts-file entries.
-- Node or subnet.
-- DNS cache state.
-- Container runtime DNS settings.
-- Application/runtime DNS caching.
-- NetworkPolicy and firewall.
-
-If only one node's pods fail, node-local DNS or that node's network path becomes a strong suspect.
-
-### Step 5 - Query a specific configured resolver
-
-```bash
-dig @<resolver-ip> service-b.example A
-dig @<resolver-ip> service-b.example AAAA
-```
-
-If permitted and relevant, compare recursive and authoritative answers. Do not bypass approved DNS architecture as a permanent workaround.
-
-### Step 6 - Check Kubernetes-specific objects
-
-```bash
-kubectl get service -n <namespace> service-b -o yaml
-kubectl get endpointslice -n <namespace> -l kubernetes.io/service-name=service-b -o wide
-kubectl get pods -n kube-system -l k8s-app=kube-dns -o wide
-kubectl logs -n kube-system -l k8s-app=kube-dns --tail=200
-```
-
-Check:
-
-- The Service exists in the expected namespace.
-- Service name is correct.
-- CoreDNS is ready and not restarting.
-- DNS error/latency metrics and upstream resolver health.
-- Network policy allows DNS egress.
-- Cluster domain matches configuration.
-
-For a normal ClusterIP service, empty endpoints do not usually make the service name fail DNS; they make traffic have no usable backend. Headless service behavior is different because DNS answers are derived from endpoints.
-
-### Step 7 - Check caching carefully
-
-Identify caches at the application, JVM/runtime, OS, node, and recursive resolver. Flushing a cache can prove staleness, but first preserve the old answer and TTL as evidence.
-
-Do not solve DNS by permanently hardcoding an IP. That bypasses failover, scaling, certificate hostname validation, and service discovery, and it creates a future outage.
-
-### Step 8 - Confirm the answer is usable
-
-After DNS succeeds:
-
-1. Verify the returned address belongs to the intended environment/service.
-2. Test every returned address and the intended port.
-3. Check IPv4/IPv6 selection.
-4. Confirm old addresses disappear after the expected TTL.
-
-### Step 9 - Fix and prevent
-
-Possible fixes:
-
-- Correct hostname, namespace, record, or private-zone link.
-- Repair resolver/CoreDNS health and capacity.
-- Allow DNS UDP and TCP traffic.
-- Correct search-domain or resolver configuration.
-- Remove stale service registration.
-- Set appropriate TTL and application cache behavior.
-- Monitor DNS error codes, latency, saturation, and record freshness.
-
-## Interview-ready answer
-
-> I would identify whether DNS returns NXDOMAIN, SERVFAIL, timeout, an empty answer, or a wrong/stale address. I would query the exact name from the affected Service A instance, record the configured resolver, search domains, response code, A/AAAA answers, TTL, and timing, and compare those with a working instance. I would trace application cache, OS/container resolver, node-local or CoreDNS, recursive resolver, and authoritative/service-discovery data. In Kubernetes I would verify the Service and namespace, CoreDNS health, DNS egress policy, and EndpointSlice behavior for headless services. After correcting the DNS layer I would test every returned IP and the real API port; I would not hardcode an IP as the fix.
-
----
-
-# 10. Question 9 - Hostname Works From a Laptop but Not From Service A
-
-## Interview question
-
-> The hostname works from your laptop but does not work from Service A. What could be wrong?
-
-## Key principle
-
-The laptop and Service A are different clients. They can have different:
-
-- DNS resolvers and search domains.
-- VPN and private-network access.
-- Hosts-file entries and caches.
-- Routes, proxies, and `NO_PROXY`.
-- Firewalls, security groups, and NetworkPolicies.
-- TLS trust stores and client certificates.
-- Service identities and authorization policies.
-- IPv4/IPv6 preference.
-- Service-mesh interception.
-- Environment-specific configuration.
-
-A laptop success proves only that the laptop's path works.
-
-## Common scenarios
-
-| Laptop | Service A | Likely difference |
+| Test result | Interpretation | Next evidence |
 |---|---|---|
-| Resolves private name through VPN | Pod resolver returns NXDOMAIN | Private DNS zone or resolver forwarding |
-| Uses hosts-file override | Service A has no override | Laptop-only local configuration |
-| Reaches public endpoint | A uses private endpoint | Different effective URL or split DNS |
-| Bypasses proxy | A sends internal call to proxy | `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` |
-| Trusts corporate CA | Container trust store lacks CA | TLS trust bundle |
-| Has user credentials | Workload identity lacks permission | Authentication/authorization |
-| Uses IPv4 | Runtime prefers unreachable IPv6 | Address-family selection |
-| Is outside service mesh | A is subject to mTLS/egress policy | Sidecar or mesh authorization |
-
-## Step-by-step debugging
-
-### Step 1 - Compare the exact request
-
-On both clients record:
-
-```text
-effective URL
-resolved IPs
-source IP/network
-proxy used
-TLS server name
-HTTP method/path
-authentication identity
-```
-
-Do not compare a browser request on the laptop with a different health URL from Service A and call them equivalent.
-
-### Step 2 - Compare DNS
-
-Run DNS tests from both environments and compare:
-
-- Resolver server.
-- Search suffix.
-- A/AAAA answers.
-- CNAME chain.
-- TTL.
-- response code.
-
-If laptop is connected to a VPN, test whether the VPN supplies a private resolver or route unavailable to Service A's network.
-
-### Step 3 - Compare route and TCP access
-
-Test the exact destination port from both environments. Review Service A's subnet route, private-zone linkage, security identity, firewall, NetworkPolicy, and service-mesh egress rules.
-
-### Step 4 - Compare proxy behavior
-
-Inspect effective environment or runtime settings:
-
-```text
-HTTP_PROXY
-HTTPS_PROXY
-NO_PROXY
-application-specific proxy configuration
-```
-
-Common errors:
-
-- Internal hostname omitted from `NO_PROXY`.
-- CIDR or domain matching behaves differently in the HTTP library.
-- Service A is expected to use an egress proxy but connects directly.
-- Proxy cannot resolve the private hostname even though A can.
-
-### Step 5 - Compare TLS trust and identity
-
-The laptop may trust a corporate CA installed by device management while a container has only a default public trust store. Compare:
-
-- CA bundles.
-- Certificate hostname.
-- SNI.
-- mTLS client certificate and key.
-- Workload identity.
-- Certificate validity and clock.
-
-### Step 6 - Compare application behavior
-
-If a shell request in the Service A container succeeds but the application fails, compare:
-
-- Runtime DNS cache.
-- Custom trust store.
-- HTTP client proxy.
-- Headers/token.
-- URL construction.
-- Connection pool.
-- Timeouts.
-
-### Step 7 - Fix the environment, not the symptom
-
-Correct private DNS linkage, resolver forwarding, routes, policies, proxy bypass, trust bundles, or workload identity through managed configuration. Avoid copying a laptop hosts-file entry or disabling TLS verification.
-
-## Interview-ready answer
-
-> A laptop success does not prove Service A's environment works. I would run equivalent DNS, TCP, TLS, and HTTP tests from both clients and compare the effective URL, resolver and answers, route, proxy, trust store, client identity, and IPv4/IPv6 choice. VPN split DNS, laptop hosts-file entries, private-zone linkage, Kubernetes DNS, NetworkPolicy, `NO_PROXY`, corporate CA trust, and service-mesh mTLS are common differences. I would correct the managed runtime configuration and verify from Service A itself rather than using the laptop as the final test.
-
----
-
-# 11. Question 10 - HTTP 502 From an API Gateway
-
-## Interview question
-
-> Service A receives HTTP 502 from the API gateway. How would you investigate?
-
-## What 502 usually means
-
-`502 Bad Gateway` normally means an intermediary acting as a gateway or proxy could not obtain or accept a valid response from its configured upstream.
-
-```text
-Service A -> Gateway -> Service B
-                  |
-                  X upstream connection/response problem
-Service A <- 502
-```
-
-The exact reason is product-specific. Always identify the component that generated the response using headers, body format, access logs, route ID, and request ID.
-
-## Detailed causes by phase
-
-### Before connecting to B
-
-- Upstream hostname cannot be resolved.
-- Gateway resolves a stale or wrong IP.
-- Wrong upstream host or port.
-- No route or policy from gateway to B.
-- Connection refused or reset.
-- One backend target is unhealthy.
-
-### During TLS to B
-
-- HTTPS configured against an HTTP backend or the reverse.
-- Certificate expired or not yet valid.
-- Backend certificate hostname does not match.
-- Gateway lacks the issuing CA.
-- SNI selects the wrong virtual host.
-- Backend requires mTLS but gateway has no valid client certificate.
-- TLS version/cipher mismatch.
-
-### During HTTP exchange
-
-- Backend closes the connection before a complete response.
-- Malformed HTTP status line or headers.
-- Truncated/chunked response error.
-- HTTP/1.1, HTTP/2, gRPC, or WebSocket protocol mismatch.
-- Invalid upstream response headers.
-- Response header exceeds gateway limit.
-- Backend resets while serializing or streaming.
-- Stale pooled connection was reused after backend/LB idle timeout.
-
-### Routing/deployment causes
-
-- Gateway route points to wrong service/version/port.
-- Backend pool contains a terminating or startup-incomplete instance.
-- Health check is too shallow or checks a different port.
-- Deployment mixes incompatible protocol versions.
-- Service-mesh sidecar rejects gateway traffic.
-
-## Step-by-step debugging
-
-### Step 1 - Identify the 502 generator
-
-Capture:
-
-- Response headers such as `Server`, `Via`, gateway request ID, or vendor error code.
-- Gateway route/upstream name.
-- Timestamp.
-- Service A request/trace ID.
-- Response body, redacted if necessary.
-
-Service B can itself return a 502 if it acts as a gateway, so do not assume the first visible gateway generated it.
-
-### Step 2 - Read the gateway's detailed error
-
-Gateway logs often distinguish:
-
-```text
-DNS resolution failed
-upstream connect error
-connection refused
-connection reset before headers
-TLS handshake failure
-upstream sent invalid header
-upstream closed connection
-no route to host
-```
-
-That subreason is more useful than the public 502 status.
-
-### Step 3 - Determine whether B saw the request
-
-- No B request log/trace: investigate gateway DNS, TCP, TLS, routing, target choice, or logging gaps.
-- B saw request and crashed/reset: inspect B exception and process/resource state.
-- B completed successfully but gateway returned 502: inspect response protocol, headers, streaming, gateway limits, connection reuse, and target correlation.
-
-### Step 4 - Test gateway-to-B connectivity
-
-Run the diagnostic from the gateway's network/runtime or an approved equivalent:
-
-```text
-resolve upstream hostname
-connect to exact upstream port
-perform TLS with gateway's SNI/trust/client identity
-send expected Host header and route
-```
-
-A test from Service A directly to B can be useful for comparison, but it does not prove the gateway path works.
-
-### Step 5 - Inspect all backend targets
-
-Map 502s to:
-
-- Upstream IP/instance.
-- Node/zone.
-- Application version.
-- Connection reuse state.
-
-If only one target fails, drain it and investigate as an instance-specific incident.
-
-### Step 6 - Validate protocol configuration
-
-Check both sides agree on:
-
-- HTTP versus HTTPS.
-- HTTP/1.1 versus HTTP/2 or h2c.
-- gRPC support.
-- SNI and `Host` header.
-- WebSocket upgrade.
-- Response header/body limits.
-- Keep-alive and idle timeout.
-
-### Step 7 - Check rollout and lifecycle
-
-Inspect whether:
-
-- Listener closes before target deregistration.
-- Readiness becomes true before the full proxy/app stack is ready.
-- Gateway keeps stale backend connections through deployment.
-- Old and new versions use incompatible response behavior.
-
-### Step 8 - Fix and prevent
-
-Possible fixes:
-
-- Correct upstream host, port, protocol, SNI, or trust.
-- Repair gateway-to-B network permissions.
-- Remove stale/unhealthy targets.
-- Fix backend resets or malformed responses.
-- Align keep-alive and idle behavior.
-- Add proper readiness and graceful draining.
-- Validate gateway routes and TLS in deployment tests.
-- Alert on 502 subreason and backend target, not only total 5xx.
-
-## Interview-ready answer
-
-> I would first identify which proxy generated the 502 and read its product-specific upstream error. A 502 usually means the gateway failed to connect to B or did not receive a valid upstream response. I would correlate the gateway request ID with B and determine whether B saw the request. Then I would test DNS, TCP, TLS, SNI, protocol, `Host` header, and route from the gateway's environment, inspect every backend target, and check for resets, malformed or oversized headers, protocol mismatch, stale keep-alive connections, and rollout/draining races. I would fix the exact upstream failure and verify through the gateway path.
-
----
-
-# 12. Question 11 - HTTP 503 From a Gateway
-
-## Interview question
-
-> Service A receives HTTP 503 from the gateway. What could be the cause, and how would you debug it?
-
-## What 503 usually means
-
-`503 Service Unavailable` means the component generating the response considers the service temporarily unable to handle the request. A gateway often returns it when no usable backend is available, but Service B can also intentionally return 503 because it is overloaded, in maintenance, not ready, or protected by a circuit breaker.
-
-## Detailed causes
-
-| Generator | Cause |
-|---|---|
-| Gateway/load balancer | No healthy backend targets |
-| Gateway/load balancer | Route exists but backend pool/endpoints are empty |
-| Gateway/load balancer | All targets failed health checks |
-| Gateway/load balancer | Circuit breaker or outlier detection ejected all targets |
-| Gateway/load balancer | Connection/concurrency queue or gateway capacity exhausted |
-| Service discovery | No registered or ready instances |
-| Kubernetes | Service selector mismatch or no ready EndpointSlices |
-| Deployment | All old instances drained before new ones became ready |
-| Service B | Explicit overload/load-shedding response |
-| Service B | Maintenance mode or readiness gate |
-| Service B | Critical dependency unavailable and application chooses 503 |
-| Sidecar/service mesh | No healthy upstream, policy rejection mapped to 503, or circuit open |
-| Rate/concurrency layer | Limit is mapped to 503 instead of 429 |
-
-## Step-by-step debugging
-
-### Step 1 - Identify who generated 503
-
-Use response headers/body, gateway access logs, B access logs, and request IDs.
-
-- Gateway generated it without contacting B: focus on pool health, discovery, policy, and gateway capacity.
-- B generated it: inspect B's explicit rejection reason, readiness, overload, and dependencies.
-
-### Step 2 - Inspect backend availability
-
-Check:
-
-- Expected versus healthy target count.
-- Health-check status and exact failure reason.
-- Endpoint/service-discovery registration.
-- Target port, protocol, path, `Host` header, and expected status.
-- Readiness of each instance.
-- Availability by zone and version.
-
-For Kubernetes:
-
-```bash
-kubectl get service -n <namespace> service-b -o yaml
-kubectl get endpointslice -n <namespace> -l kubernetes.io/service-name=service-b -o wide
-kubectl get pods -n <namespace> -l app=service-b -o wide
-kubectl describe pod -n <namespace> <service-b-pod>
-```
-
-### Step 3 - Investigate why health checks fail
-
-Do not stop at "unhealthy." Determine:
-
-- Connection refused?
-- Timeout?
-- TLS failure?
-- Wrong path or port?
-- Unexpected 301/401/403/404/500?
-- Health-check source blocked by firewall/policy?
-- Required `Host` header missing?
-- Check interval/threshold too aggressive during startup?
-
-### Step 4 - Check deployment and scaling timeline
-
-Look for:
-
-- Desired replicas dropped to zero.
-- New instances not ready.
-- Rolling-update surge/unavailable settings.
-- Readiness regression.
-- Autoscaler lag.
-- Pod disruption, node drain, or zone failure.
-- Discovery deregistration delay.
-
-### Step 5 - Check overload and protective mechanisms
-
-Inspect:
-
-- Gateway active requests, connections, queue, and rejected requests.
-- Service B concurrency, queue, thread pool, and pool saturation.
-- Rate limits and quotas.
-- Circuit-breaker state and reason.
-- Service-mesh outlier ejection.
-- Load-shedding logic.
-- Retry storms.
-
-An overload 503 may be the service protecting itself. Disabling the protection without adding capacity or reducing work can cause a larger failure.
-
-### Step 6 - Check dependencies when B returns 503
-
-Some services intentionally mark themselves unavailable if a critical DB, cache, or downstream service fails. Confirm:
-
-- Which dependency is considered critical.
-- Whether readiness should fail for that dependency.
-- Whether partial functionality could remain available.
-- Whether dependency recovery automatically restores readiness.
-
-### Step 7 - Restore service safely
-
-Immediate actions may include:
-
-- Roll back a bad deployment.
-- Restore healthy replica count.
-- Correct health check or route.
-- Drain a bad target.
-- Scale within known dependency capacity.
-- Reduce traffic through rate limiting or feature control.
-- Repair the critical dependency.
-
-Permanent prevention:
-
-- Deployment availability guards.
-- Meaningful readiness and startup probes.
-- Capacity and saturation alerts.
-- Multi-zone backend distribution.
-- Bounded retries and circuit breakers.
-- Health-check contract tests.
-- Alerts on healthy-target count and endpoint emptiness.
-
-## Interview-ready answer
-
-> I would first identify whether the gateway, service mesh, or B generated the 503. If it is the gateway, I would inspect the expected and healthy target counts, service-discovery or EndpointSlice data, and the exact health-check failure reason, including port, path, protocol, TLS, `Host` header, and policy. I would correlate with deployments, scaling, node events, and circuit-breaker or outlier-ejection state. If B generated it, I would inspect overload/load-shedding, readiness, maintenance mode, and critical dependencies. I would restore healthy capacity or correct routing/health checks, but I would not disable protective 503 behavior without addressing the load.
-
----
-
-# 13. Question 12 - HTTP 504 From a Gateway
-
-## Interview question
-
-> Service A receives HTTP 504 from the gateway. How would you investigate?
-
-## What 504 usually means
-
-`504 Gateway Timeout` normally means a gateway or proxy did not receive the required upstream response within its configured time.
-
-```text
-A -> Gateway -> B -> DB/C
-       |
-       | waits for upstream
-       X timeout expires
-A <- 504
-```
-
-Service B can still be alive and may even finish the operation after the gateway returns 504. This is important for non-idempotent requests: a client retry could create duplicate work.
-
-## Detailed causes
-
-- Service B request queue is long.
-- B's worker/event-loop capacity is exhausted.
-- B has high CPU, CPU throttling, memory pressure, or long GC pauses.
-- B waits for a DB pool connection.
-- Query is slow, blocked, or returns excessive data.
-- B waits for Service C, cache, Kafka, storage, or an external provider.
-- HTTP client pool in B is exhausted.
-- Response serialization, compression, or streaming is slow.
-- Network packet loss or stalled upstream connection.
-- Gateway queueing consumes part of the timeout.
-- Gateway upstream timeout is shorter than valid B latency.
-- B retries a downstream operation inside the request.
-- Gateway and B timeout budgets are misordered.
-- One backend instance is slow.
-- Large requests or responses cross a size/processing threshold.
-
-## Step-by-step debugging
-
-### Step 1 - Identify the 504 generator and timeout
-
-Record:
-
-- Gateway/proxy name and route.
-- Upstream response timeout.
-- Idle timeout.
-- Total observed duration.
-- Service A's own deadline.
-- Request ID/trace ID.
-- Backend instance.
-
-If a 504 consistently occurs at exactly 30.0 seconds, a configured 30-second boundary is a strong clue.
-
-### Step 2 - Confirm whether B received and completed the request
-
-Build one of these timelines:
-
-```text
-Gateway starts request at 10:00:00.000
-B starts request       at 10:00:00.015
-Gateway returns 504    at 10:00:05.000
-B completes request    at 10:00:08.200
-```
-
-This proves B exceeded the gateway budget.
-
-Or:
-
-```text
-Gateway starts request
-No B request record
-Gateway returns 504
-```
-
-This points to gateway queueing, upstream connect/TLS delay, wrong target, request transmission, or missing B telemetry.
-
-### Step 3 - Use a trace waterfall
-
-Example:
-
-```text
-Gateway total             5.00 s
-  Gateway queue           0.20 s
-  B request queue         0.90 s
-  B application           0.15 s
-  DB pool wait            1.10 s
-  DB query                2.45 s
-  Response                0.20 s
-```
-
-The correct fix is likely pool/query/capacity work, not a blanket gateway timeout increase.
-
-### Step 4 - Compare successful and 504 requests
-
-Group by:
-
-- B instance.
-- Endpoint.
-- Tenant/data key.
-- Payload/response size.
-- Cache hit/miss.
-- DB query or plan.
-- Downstream selected.
-- Time and traffic.
-
-### Step 5 - Check queueing and saturation
-
-At the exact incident time inspect:
-
-- Gateway queue and connection pool.
-- B worker queue/thread pool/event loop.
-- DB and HTTP pool pending requests.
-- CPU throttling, memory, GC.
-- Dependency latency and errors.
-- DB locks, slow queries, I/O, connections.
-- Network retransmissions.
-
-### Step 6 - Audit the complete timeout budget
-
-Example of a coherent budget:
-
-```text
-Service A total deadline:       10.0 s
-Gateway upstream timeout:        8.5 s
-Service B internal deadline:     7.5 s
-B -> C timeout with retries:     3.0 s total
-DB statement timeout:            4.0 s
-Response/network margin:         1.0 s
-```
-
-The actual numbers depend on the service objective, but inner work must stop early enough to return a useful response before outer deadlines expire.
-
-### Step 7 - Check cancellation and duplicate-work risk
-
-When the gateway times out:
-
-- Does it close/cancel the upstream request?
-- Does B detect cancellation?
-- Does B continue DB or downstream work?
-- Is the operation idempotent?
-- Will Service A retry?
-- Is an idempotency key used for create/payment/order operations?
-
-This is both a reliability and data-correctness concern.
-
-### Step 8 - Fix the measured latency source
-
-Possible fixes:
-
-- Optimize query/code and remove blocking.
-- Correct pool/concurrency sizing.
-- Add backpressure or load shedding.
-- Scale the constrained tier within dependency limits.
-- Make long operations asynchronous.
-- Reduce payload/result size or stream correctly.
-- Bound retries and propagate deadline/cancellation.
-- Repair network loss.
-- Increase timeout only when valid latency legitimately requires it.
-
-### Step 9 - Verify
-
-Confirm:
-
-- No 504s under representative load.
-- p95/p99 fit within the gateway budget with margin.
-- Queues and pools do not trend to saturation.
-- Timed-out operations stop or remain idempotent.
-- All backend instances perform consistently.
-
-## Interview-ready answer
-
-> A 504 generally means a gateway waited longer than its upstream deadline. I would identify which gateway generated it and the exact timeout, then correlate its request ID with B to see whether B received and completed the request. I would create a latency waterfall across gateway queueing, B queueing and code, pool waits, DB, downstream calls, and response transfer, and compare successful and failed requests by backend and data shape. I would audit nested timeout and retry budgets and check whether work continues after the gateway cancels, especially for non-idempotent operations. I would fix the measured bottleneck or make long work asynchronous; I would increase the timeout only if the service objective justifies it.
-
----
-
-# 14. Question 13 - Only One Service B Instance Is Failing
-
-## Interview question
-
-> Only one instance of Service B is failing while the other instances work. How would you identify the problem?
-
-## What this pattern tells you
-
-If identical traffic succeeds on B1, B2, and B4 but fails on B3, shared components are less likely to be the sole cause. Focus on what is unique to B3:
-
-```text
-instance configuration
-application version/build
-secret/certificate
-node/host
-zone/subnet
-local cache/state/disk
-resource pressure
-dependency path/DNS
-startup lifecycle
-```
-
-A shared dependency can still be involved if B3 uses a different connection, shard, credential, DNS answer, or network path.
-
-## Detailed causes
-
-- Different application image, build, or partially completed deployment.
-- Configuration, environment variable, feature flag, secret, or certificate drift.
-- Failed startup initialization hidden by shallow readiness.
-- CPU throttling, memory pressure, GC, thread exhaustion, or pool exhaustion.
-- Node disk, network interface, conntrack, DNS, or clock issue.
-- B3 is in a different zone/subnet with a broken dependency route.
-- B3 resolves a dependency to a different or stale IP.
-- Local cache corruption or poisoned entry.
-- Stale file, temporary state, or local disk full.
-- Certificate expired only on B3.
-- Connection pool contains stale/broken connections.
-- B3 receives disproportionate traffic because of weight or sticky sessions.
-- Clock skew causes token/certificate validation failures.
-- Different runtime/JVM flags or resource limits.
-- Readiness check is cached or does not exercise the failing capability.
-
-## Step-by-step debugging
-
-### Step 1 - Prove correlation with B3
-
-Use:
-
-- Load-balancer/gateway upstream target.
-- Trace attribute.
-- Pod name/hostname/instance ID in logs.
-- Response header added for internal diagnostics.
-- Source and destination IP.
-
-Calculate B3's failure and latency rate versus other instances. Do not rely on one anecdotal request.
-
-### Step 2 - Protect users while preserving evidence
-
-If impact is significant:
-
-1. Drain B3 through the normal load-balancer/orchestrator process.
-2. Avoid abruptly killing in-flight non-idempotent work.
-3. Preserve logs, events, metrics, config hashes, thread/heap/runtime diagnostics, and node data as appropriate.
-4. Keep enough healthy capacity before removing it.
-
-Replacing B3 may restore service but erase the evidence needed to prevent recurrence.
-
-### Step 3 - Compare immutable identity
-
-Compare B3 with a healthy instance:
-
-```text
-image digest
-application version/commit
-deployment revision
-runtime version
-startup arguments
-resource requests/limits
-node and zone
-creation/start time
-```
-
-Use image digest rather than a mutable tag alone.
-
-### Step 4 - Compare effective configuration safely
-
-Compare names and hashes or redacted values for:
-
-- Environment variables.
-- Config files/ConfigMaps.
-- Feature flags.
-- Secret/certificate versions.
-- Service URLs.
-- Proxy and DNS settings.
-- Database/cache endpoints.
-- Runtime flags.
-
-Never dump secret values into shared logs.
-
-### Step 5 - Compare runtime and resource state
-
-At the same timestamp compare:
-
-- Request rate and latency.
-- CPU and throttling.
-- Memory/heap and GC.
-- Threads/event loops/queues.
-- DB and HTTP connection pools.
-- File descriptors and sockets.
-- Disk space/I/O.
-- Network errors/retransmissions.
-- Restarts and termination reason.
-
-### Step 6 - Test dependencies from B3 and a healthy instance
-
-Use equivalent DNS, TCP, TLS, and application-level tests for DB, cache, Kafka, and downstream services. Compare resolved IPs, certificates, route, and identity.
-
-### Step 7 - Inspect node and zone
-
-If other workloads on B3's node or zone also fail, investigate:
-
-- Node networking and DNS.
-- CNI or service-mesh agent.
-- NAT/conntrack.
-- Disk/memory/PID pressure.
-- Clock synchronization.
-- Zone-local routes or dependencies.
-
-### Step 8 - Recreate only after collecting evidence
-
-If a clean replacement works:
-
-- Compare replacement with failed instance evidence.
-- Determine whether the problem was reproducible configuration drift, node state, local corruption, or transient infrastructure.
-- Do not close with "pod restart fixed it." Record why replacement changed the failing condition.
-
-### Step 9 - Prevent recurrence
-
-- Enforce immutable images and configuration checksums.
-- Add startup/readiness validation.
-- Alert on per-instance error/latency outliers.
-- Use automated outlier detection carefully.
-- Add graceful drain and lifecycle hooks.
-- Eliminate mutable local state.
-- Spread replicas across nodes/zones.
-- Monitor certificate/secret rollout consistency.
-
-## Interview-ready answer
-
-> I would first prove that failures correlate with one instance using gateway logs, trace attributes, pod name, or destination IP. I would drain that instance if necessary while preserving capacity and evidence. Then I would compare it with a healthy instance across image digest, deployment revision, effective configuration, secret/certificate version, node and zone, resource limits, runtime metrics, pools, logs, DNS answers, and dependency connectivity. I would inspect local cache/disk state and node networking as well. Recreating the instance can mitigate impact, but I would still explain why the replacement differs and add per-instance outlier monitoring and drift prevention.
-
----
-
-# 15. Question 14 - Requests Routed to One Particular Instance Fail
-
-## Interview question
-
-> Requests routed to one particular Service B instance are failing. What could cause this, and how would you debug the routing?
-
-## How this differs from Question 13
-
-Question 13 focuses on comparing a bad instance with healthy instances. This question additionally asks why the routing layer continues to select that bad instance.
-
-There may be two defects:
-
-1. The instance cannot serve the request.
-2. The gateway/load balancer/service discovery incorrectly considers it eligible.
-
-## Detailed causes
-
-### Instance-side causes
-
-- Different version/configuration/secret.
-- Resource or dependency failure.
-- Local corrupted state.
-- Listener accepts connections but business endpoint fails.
-- Readiness is stale, cached, or too shallow.
-
-### Routing-side causes
-
-- Health check tests only `/health` while business API is broken.
-- Health check uses a different port, protocol, host, or network path.
-- Failure threshold is too high, so bad target remains eligible too long.
-- Target registration is stale.
-- Terminating target is not drained before listener/dependency shutdown.
-- Readiness changes do not propagate promptly to the load balancer.
-- Sticky session repeatedly pins a user to the bad target.
-- Weight is incorrect or target receives disproportionate traffic.
-- DNS round-robin still advertises a removed target.
-- Cross-zone routing sends traffic through a broken path.
-- Service-mesh outlier detection is disabled or misconfigured.
-- Gateway route selects the wrong subset/version.
-- Direct pod registration uses stale pod IP.
-
-## Step-by-step debugging
-
-### Step 1 - Prove target selection
-
-For failed and successful requests capture:
-
-```text
-gateway route
-upstream cluster/pool
-upstream IP and port
-target instance/pod
-routing weight
-session/stickiness key
-zone
-health state at request time
-```
-
-### Step 2 - Inspect the routing layer's target list
-
-Compare:
-
-- Expected instances.
-- Registered/discovered instances.
-- Healthy/eligible instances.
-- Draining instances.
-- Removed but cached instances.
-- Weight and zone.
-
-In Kubernetes:
-
-```bash
-kubectl get endpointslice -n <namespace> -l kubernetes.io/service-name=service-b -o yaml
-kubectl get pod -n <namespace> <bad-pod> -o yaml
-```
-
-Check readiness conditions and endpoint `ready`, `serving`, and `terminating` state where supported.
-
-### Step 3 - Reproduce directly and through the router
-
-When approved, test:
-
-1. Normal gateway/service URL.
-2. The specific target IP and port while preserving required HTTP `Host` and TLS SNI.
-3. A known healthy target with the same request.
-
-Direct target tests can bypass authentication, mesh, or policy. Use them only as controlled diagnostics, not as a production workaround.
-
-### Step 4 - Validate the health-check contract
-
-Verify:
-
-- Path exercises traffic acceptance, not only process existence.
-- Port and protocol match real routing.
-- Required `Host` header and TLS SNI are correct.
-- Check source is permitted by policy.
-- Success status range is correct.
-- Interval, timeout, healthy threshold, and unhealthy threshold fit startup and failure behavior.
-- Check cannot remain successful from a stale cache.
-
-### Step 5 - Inspect lifecycle timing
-
-Build a deployment timeline:
-
-```text
-readiness false
-endpoint marked terminating
-load balancer starts drain
-application rejects new work
-listener closes
-process exits
-```
-
-The ordering should prevent new traffic after the application can no longer serve it.
-
-### Step 6 - Check stickiness and weighting
-
-If only certain users fail:
-
-- Inspect cookie/header/source-IP affinity.
-- Confirm sticky-session TTL.
-- Determine whether one shard/tenant maps to the target.
-- Check canary/version weights.
-
-### Step 7 - Mitigate and correct
-
-- Drain/remove the bad target.
-- Correct readiness or health check.
-- Fix deregistration and graceful shutdown timing.
-- Remove stale DNS/discovery registration.
-- Correct weights, subsets, and stickiness.
-- Fix the instance root cause from Question 13.
-- Add per-target error-rate and latency outlier alerts.
-
-## Interview-ready answer
-
-> I would prove which target handled each request and inspect the load balancer or service-discovery target list, health state, weights, stickiness, zone, and lifecycle state at that time. I would compare a normal routed request with controlled direct tests to the bad and healthy targets while preserving `Host` and SNI. Then I would validate that health checks use the real port, protocol, route, and traffic capability, and inspect readiness propagation, stale registration, and graceful draining during rollout. I would remove the bad target to protect users, fix both the instance issue and the reason it remained eligible, and monitor errors per target.
-
----
-
-# 16. Question 15 - Health Endpoint Is Healthy, but Actual APIs Fail
-
-## Interview question
-
-> Service B is healthy according to its health endpoint, but actual API requests are failing. Why, and how would you investigate?
-
-## Health does not equal business availability
-
-Health endpoints answer only the questions they were designed to answer.
-
-```text
-GET /health -> 200
-```
-
-may prove only:
-
-```text
-the process can accept one lightweight unauthenticated request
-```
-
-It may not prove:
-
-```text
-authentication works
-the orders route exists
-the database query works
-the correct tenant data is available
-the thread and connection pools have capacity
-Kafka/cache/Service C is usable
-large responses can be generated
-the service meets its latency objective
-```
-
-## Detailed causes
-
-| Cause | Why health remains green |
-|---|---|
-| Liveness-only endpoint | It checks only that the process/event loop responds |
-| Health bypasses authentication | Business route fails token validation or authorization |
-| Health uses a trivial DB query | Real query hits missing table/index, lock, permissions, or bad data |
-| Health result is cached | Endpoint reports old state |
-| Specific endpoint code bug | Health route does not execute that code |
-| Data-specific failure | Only a tenant/order/payload triggers the defect |
-| Dependency omitted from readiness | DB/cache/Kafka/C is unavailable but health does not check it |
-| Pool/thread saturation | Lightweight health request uses reserved path or succeeds while real work queues |
-| Different port/path | Platform health checks management port, traffic uses application port |
-| Feature flag/version mismatch | Health is common but business path differs |
-| Certificate/auth clock issue | Public health is unauthenticated; secured APIs reject requests |
-| Payload/response limit | Small health response avoids gateway and serialization limits |
-| Partial outage is intentional | Service remains ready for unaffected endpoints |
-| Health-check identity has extra access | Probe succeeds while normal workload identity fails |
-
-## Step-by-step debugging
-
-### Step 1 - Define the health endpoint's contract
-
-Read the implementation and deployment configuration. Determine:
-
-- Is it liveness, readiness, startup, or a generic health endpoint?
-- Which dependencies does it check?
-- Does it use cached results?
-- Which port and network path invokes it?
-- Does it require authentication?
-- What timeout and success status does the platform use?
-
-### Step 2 - Reproduce the real failing business request
-
-Capture:
-
-- Method and full path.
-- Safe representation of headers and auth identity.
-- Payload/data category.
-- Exact status/exception.
-- Request ID.
-- Source and destination instance.
-
-Do not replace the business test with `/health`.
-
-### Step 3 - Compare request paths
-
-```text
-Health:
-gateway -> management port -> health handler -> 200
-
-Business:
-gateway -> application port -> auth -> route -> DB -> C -> serialization
-```
-
-Find the first component present only in the failing path.
-
-### Step 4 - Interpret the real response
-
-- 401/403: identity, token claims, roles, clock, or authorization policy.
-- 404/405: route, path prefix, method, API version, or deployment mismatch.
-- 400/415: validation, content type, or schema.
-- 429/503: throttling, overload, readiness, or load shedding.
-- 500: code, data, configuration, or dependency exception.
-- Timeout/504: queueing, resource saturation, DB, downstream, or timeout budget.
-
-### Step 5 - Trace business dependencies
-
-Use traces and logs to inspect:
-
-- Auth provider/key discovery.
-- Database query and pool.
-- Cache.
-- Kafka/queue.
-- Service C or external provider.
-- Feature-flag service.
-- Object storage.
-- Serialization and response size.
-
-### Step 6 - Check capacity and isolation
-
-A health endpoint can stay fast because it:
-
-- Does almost no work.
-- Uses a separate management port/thread pool.
-- Avoids the saturated DB/HTTP pool.
-- Has higher priority.
-
-Inspect business request queues, pools, concurrency limits, CPU throttling, GC, and dependency capacity.
-
-### Step 7 - Check data and endpoint specificity
-
-Compare:
-
-- One endpoint versus all endpoints.
-- One tenant/record versus all data.
-- One write versus reads.
-- Large versus small requests.
-- Cache hit versus miss.
-- One version/feature flag versus another.
-
-### Step 8 - Improve health design without creating a restart loop
-
-Use distinct probes:
-
-- **Startup:** Has initialization completed?
-- **Liveness:** Is the process making progress, or must it be restarted?
-- **Readiness:** Should this instance receive new traffic now?
-- **Synthetic business check:** Can a safe representative transaction complete end to end?
-
-Do not make liveness depend on every remote service. A temporary database outage could cause all application instances to restart repeatedly, adding load without repairing the database. Critical dependency checks generally belong in readiness or external synthetic monitoring, with deliberate failure semantics.
-
-### Step 9 - Fix and verify
-
-- Correct the endpoint-specific code, auth, data, dependency, route, or capacity issue.
-- Improve readiness if the instance should not receive traffic in that condition.
-- Add safe synthetic tests for critical business flows.
-- Alert on business success rate and latency, not only health status.
-- Verify a representative business transaction through the normal gateway and identity.
-
-## Interview-ready answer
-
-> A green health endpoint proves only what that endpoint checks. I would identify whether it is startup, liveness, or readiness and inspect its exact dependencies, port, path, cache, and identity. Then I would reproduce the real business request and classify its status or timeout, compare the health and business call paths, and trace the components used only by the business route: authentication, route mapping, data-specific logic, pools, DB, cache, Kafka, downstream services, and serialization. I would fix the real failure, improve readiness or synthetic monitoring where appropriate, and keep liveness shallow enough to avoid dependency-driven restart loops.
-
----
-
-# 17. Liveness, Readiness, Startup, and Synthetic Checks
-
-## Liveness
-
-Question:
-
-> Is the process alive and making progress, or should the platform restart it?
-
-Liveness should generally be local and stable. It should not fail merely because a remote database has a temporary outage.
-
-## Readiness
-
-Question:
-
-> Should this instance receive new traffic now?
-
-Readiness can consider critical initialization, listener state, local saturation, required configuration, and carefully selected dependencies. If readiness fails, routing should remove the instance without necessarily restarting it.
-
-## Startup
-
-Question:
-
-> Has this slow-starting application completed initialization?
-
-A startup probe prevents liveness from killing an application that legitimately needs more initialization time.
-
-## Synthetic business check
-
-Question:
-
-> Can a safe, representative user transaction complete through the real path?
-
-Synthetic checks are external monitoring, not necessarily pod probes. They can validate DNS, gateway, authentication, service code, and dependencies end to end.
-
-| Check | Failure action | Typical scope |
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
+
+## Alternate branches kept alive
+
+The symptom can have several causes; I reject each only with boundary evidence.
+
+| Branch | Mechanism/shape | Deciding next test |
 |---|---|---|
-| Startup | Continue waiting or restart after startup budget | Initialization |
-| Liveness | Restart instance | Process progress |
-| Readiness | Stop routing new traffic | Traffic capability |
-| Synthetic | Alert/investigate; possibly automate controlled response | Business availability |
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
+
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
+
+## Fully worked causal chain
+
+1. At 16:22 UTC the triggering production state changed.
+2. conditional forwarder 10.40.0.53 became unreachable after route removal.
+3. Mechanically, CoreDNS could resolve other zones but failed delegated zone before TCP.
+4. Therefore `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero`.
+5. Trace `08f92f3577b34da6a3ce929d0e0e0008` showed `A 2.01s -> dns.lookup 2s ERROR SERVFAIL; no TCP/TLS/B`.
+6. It selected log evidence `UnknownHostException; server failure after 2 attempts`.
+7. The safe failed/control comparison showed `corp SERVFAIL 2001ms; .svc NOERROR 3ms`.
+8. That explains the customer scope: inventory.corp names fail cluster-wide; public and .svc names work.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
+
+## Mitigation is not root cause
+
+**Mitigation:** I restore route or use designed redundant resolver.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
+
+**Root cause:** conditional forwarder 10.40.0.53 became unreachable after route removal.
+It lives at `cluster resolver forwarding` and explains why CoreDNS could resolve other zones but failed delegated zone before TCP.
+A workaround that clears current state does not correct this mechanism.
+
+## Permanent correction
+
+The primary fix is to configure two reachable forwarders and probe each conditional zone.
+I apply only controls supported by the incident evidence:
+
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
+
+## Verification of recovery
+
+The incident-specific target is: expected answer <10ms from every zone and SERVFAIL 0.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
+
+## Recurrence prevention
+
+I alert on business SLO plus `SERVFAIL 100%; lookup p99 2s; B TCP attempts fall to zero` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
+
+## Interview-ready answer
+
+> At 16:22 UTC A failed before connection setup: DNS took two seconds and returned SERVFAIL for every `inventory.corp` lookup, while TCP attempts dropped to zero. From the affected pod, Kubernetes and public control names resolved quickly, so the resolver was alive; only the conditional corporate zone failed. CoreDNS forwarding metrics identified upstream resolver `10.40.0.53`, and read-only route evidence showed that network maintenance had removed its route. I restored the approved route, then configured the designed redundant forwarder and added conditional-zone probes. I verified the expected addresses and TTL in under 10 ms from every A zone, followed by successful TCP, TLS, API, and reservation checks. I did not waste time on B's database because the request never reached TCP.
 
 ---
 
-# 18. Fast Comparison: Refused, Connect Timeout, Read Timeout, 502, 503, 504
+# Incident 9: Laptop Success Reveals Split DNS
 
-| Symptom | Connection established? | Typical owner | First checks |
-|---|---:|---|---|
-| DNS failure | No | DNS/discovery | Exact name, resolver, answer, TTL |
-| Connection refused | No | Destination listener/rejecting device | Host, port, listener, bind, target |
-| Connection timeout | No | Network path or capacity | Route, firewall, policies, NAT, packet direction |
-| TLS failure | TCP yes | TLS endpoints | Trust, SAN, SNI, mTLS, protocol |
-| Read timeout | Yes | B/dependency/response path | Trace, queues, pools, DB, downstream, timeout |
-| 502 | Varies between gateway and B | Gateway-upstream communication | Gateway subreason, DNS/TCP/TLS/protocol/reset |
-| 503 | HTTP responder reached | Gateway or service availability | Generator, healthy targets, readiness, overload |
-| 504 | Gateway connected or attempted upstream work but deadline expired | Gateway/backend latency path | Timeout owner, trace waterfall, B/dependencies |
+## Interview question
 
----
+> The hostname works from your laptop but doesn't work from Service A. What could be wrong?
 
-# 19. Detailed Command and Interpretation Guide
+## The page arrives
 
-## DNS
+At 17:11 UTC on 2026-09-13, laptop success reveals split-horizon DNS.
+The first failed request is `ord-1a9e31`, trace `09f92f3577b34da6a3ce929d0e0e0009`, from `order-a-4.18.2-k2m5q` toward `inventory-api.corp:443` and target label `inventory-api.corp`.
+The measured scope is corporate laptops resolve; prod-2 pods return NXDOMAIN.
+The first metric sentence is: laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
 
-### Windows
+## What I do in the first five minutes
 
-```powershell
-Resolve-DnsName service-b
-Resolve-DnsName service-b -Type A
-Resolve-DnsName service-b -Type AAAA
-Get-DnsClientServerAddress
-```
+### Minute 0-1: make the symptom exact
 
-### Linux
+I write `17:11 UTC | request=ord-1a9e31 | source=order-a-4.18.2-k2m5q | target=inventory-api.corp:443 | scope=corporate laptops resolve; prod-2 pods return NXDOMAIN`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
 
-```bash
-getent ahosts service-b
-dig service-b A
-dig service-b AAAA
-cat /etc/resolv.conf
-```
+### Minute 1-2: define the blast radius
 
-Use `getent` to test the normal host-resolution path and `dig` to inspect DNS details. Record the resolver and answer instead of reporting only "DNS works."
+I split the dataset until I can state: corporate laptops resolve; prod-2 pods return NXDOMAIN.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
 
-## TCP
+### Minute 2-3: open the exact dashboard
 
-### Windows
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `DNS view and resolver context`, but it remains a hypothesis.
 
-```powershell
-Test-NetConnection service-b -Port 8080 -InformationLevel Detailed
-```
+### Minute 3-4: count across boundaries
 
-### Linux
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
 
-```bash
-nc -vz -w 5 service-b 8080
-```
+### Minute 4-5: preserve evidence
 
-Interpret:
+I save trace `09f92f3577b34da6a3ce929d0e0e0009`, sanitized logs for `ord-1a9e31`, target `inventory-api.corp`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
 
-- Success: this test completed TCP.
-- Immediate refusal: inspect listener/target/reject.
-- Timeout: inspect packet path/drop/capacity.
+## Metric-by-metric causal walk
 
-## HTTP timing
+### Treat the laptop as a different source, not a control
 
-```bash
-curl -sS -o /dev/null \
-  --connect-timeout 5 \
-  --max-time 15 \
-  -w 'remote_ip=%{remote_ip} code=%{http_code} dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} first_byte=%{time_starttransfer} total=%{time_total}\n' \
-  https://service-b/health
-```
+At 17:11 UTC a developer's laptop resolves `inventory-api.corp` to `10.70.8.12` in 8 ms. Production A pods return NXDOMAIN in 5 ms. The laptop success proves only its resolver view, route, trust, proxy, and identity; it does not contradict the pod failure.
 
-Important fields:
+A's order rate remains steady, but its Inventory client records `UnknownHostException` for every request. Pool, TCP, and TLS phase counts are zero after cached connections expire. The quick NXDOMAIN is different from the two-second SERVFAIL in Incident 8: this resolver is answering authoritatively that the name is absent from its view.
 
-- `time_namelookup`: DNS stage.
-- `time_connect`: time through TCP connect.
-- `time_appconnect`: TLS completion time.
-- `time_starttransfer`: time to first response byte.
-- `time_total`: complete transfer time.
+### Compare the actual resolver contexts
 
-On Windows, use `curl.exe` to avoid confusion with any PowerShell alias in older environments.
+The laptop uses corporate resolver `10.1.0.53`; A uses cluster resolver `10.96.0.10`. I run the same fully qualified query without changing either context. The laptop gets `10.70.8.12`; the pod gets NXDOMAIN. Search suffixes do not explain it because the query is already fully qualified.
 
-## Listener
+All prod-2 pods fail, while a corporate VM succeeds. The outcome follows resolver view, not A instance, version, node, or zone. If one pod alone failed, I would inspect local cache and DNS policy. If both resolvers returned the same address but only A failed, I would proceed to route, firewall, proxy, TLS trust, and identity.
 
-### Windows
+Authoritative-zone inventory shows the record in the desktop private view but not in the prod-2 private zone. The service launch at 16:50 lacked that environment's DNS change. Hard-coding `10.70.8.12` or editing hosts would bypass TTL, failover, ownership, and audit controls, so I reject those workarounds.
 
-```powershell
-Get-NetTCPConnection -LocalPort 8080 -State Listen
-netstat -ano | findstr :8080
-```
+### Later-layer and business evidence
 
-### Linux
+Because A has no address, there are no new TCP attempts, TLS handshakes, gateway upstream calls, B server requests, or B dependency calls. B target health remains green from its own network. Those green panels do not prove A can resolve or reach it.
 
-```bash
-ss -lntp | grep ':8080'
-```
+A retries one lookup inside the resolver and then fails within its deadline; application retries remain off. Business synthetic checks from the laptop are green, while the production-source synthetic fails. That source-labeled difference is exactly why synthetics must run from consumer environments.
 
-## TLS
+After publishing the approved record into the production view, A resolves the address and completes an authenticated business request. I compare TTL and intended split-horizon behavior rather than requiring every network to receive an identical public/private answer by accident.
 
-```bash
-openssl s_client -connect service-b:443 -servername service-b -showcerts </dev/null
-```
+## Trace: follow parent to the failing child
 
-Check certificate chain, validity, SAN, SNI-selected certificate, verification result, and mTLS request.
+I search trace `09f92f3577b34da6a3ce929d0e0e0009` and start at the A server parent.
+The failed waterfall reads `A 7ms -> DNS 5ms NXDOMAIN; no connection/B span`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-1a9e31`, `source=order-a-4.18.2-k2m5q`, `backend=inventory-api.corp`, and `server.address=inventory-api.corp:443` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
 
-## Route
+## Trace-selected logs
 
-### Windows
-
-```powershell
-Get-NetRoute
-tracert service-b
-```
-
-### Linux
-
-```bash
-ip route get <destination-ip>
-traceroute service-b
-```
-
-Traceroute can be incomplete because intermediate devices often drop its probes. It does not replace a test to the real TCP port.
-
-## Kubernetes service path
-
-```bash
-kubectl get service -n <namespace> service-b -o yaml
-kubectl get endpointslice -n <namespace> -l kubernetes.io/service-name=service-b -o yaml
-kubectl get pods -n <namespace> -l app=service-b -o wide
-kubectl describe pod -n <namespace> <pod>
-kubectl logs -n <namespace> <pod> --since=30m
-kubectl logs -n <namespace> <pod> -c <sidecar> --since=30m
-kubectl get events -n <namespace> --sort-by=.lastTimestamp
-```
-
-Check Service selector, ports, ready endpoints, pod readiness/restarts, application logs, sidecar logs, and events.
-
-## Packet capture
-
-Use only when authorized and when higher-level evidence is insufficient:
-
-```bash
-tcpdump -nn -i any host <destination-ip> and port <port>
-```
-
-Capture only the minimum duration and filter needed. Protect and delete captures according to operational policy because they may contain sensitive data.
-
----
-
-# 20. How to Use Logs, Metrics, and Traces Together
-
-## Logs answer "what happened?"
-
-Useful fields:
+The trace selects the narrow log evidence `UnknownHostException from nameserver 10.96.0.10`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
 
 ```text
-timestamp in UTC
-request/trace ID
-service and instance
-source/destination
-method and normalized route
-status or exception class
-latency
-retry attempt
-dependency name
+2026-09-13T17:11:22.417Z level=ERROR request_id=ord-1a9e31 trace_id=09f92f3577b34da6a3ce929d0e0e0009
+source_instance=order-a-4.18.2-k2m5q backend=inventory-api.corp target=inventory-api.corp:443
+message="UnknownHostException from nameserver 10.96.0.10"
 ```
 
-Avoid logging tokens, secrets, and sensitive payloads.
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
 
-## Metrics answer "how much, how often, and where?"
+## Safe config, runtime, network, and direct-path test
 
-Use the RED method for services:
-
-- **Rate:** request throughput.
-- **Errors:** error/timeout/rejection rate.
-- **Duration:** latency percentiles.
-
-Use saturation metrics for resources:
-
-- Queue depth.
-- Active/max threads.
-- Pool active/pending/max.
-- CPU throttling.
-- Memory/GC.
-- Connection/NAT/conntrack utilization.
-- DB locks/I/O/connections.
-
-Do not rely only on averages or aggregate metrics. Break down by instance, route, zone, and dependency with controlled label cardinality.
-
-## Traces answer "where was time or failure spent?"
-
-An effective trace shows:
+The exact next test is to compare resolver config and same query from laptop and A.
+I run one or a few bounded probes from A's real execution context and one matched control.
 
 ```text
-gateway span
-  -> Service A client span
-     -> Service B server span
-        -> DB span
-        -> Service C client span
+FAIL request=ord-1a9e31 source=order-a-4.18.2-k2m5q target=inventory-api.corp:443
+RESULT laptop 10.70.8.12; pod NXDOMAIN
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
 ```
 
-Add target instance, route, retry count, and meaningful error attributes without recording sensitive data.
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
 
-## Without distributed tracing
+### Result branches
 
-Reconstruct the path using request ID and timestamps:
+| Test result | Interpretation | Next evidence |
+|---|---|---|
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
 
-```text
-Gateway accepted request
-A called B
-B accepted request
-B called DB/C
-B completed or failed
-A received response or timed out
-Gateway returned response
-```
+## Alternate branches kept alive
 
-Synchronize system clocks. Prefer duration measurements based on monotonic clocks within a process because wall-clock skew can make cross-system timelines misleading.
+The symptom can have several causes; I reject each only with boundary evidence.
+
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
+
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
+
+## Fully worked causal chain
+
+1. At 17:11 UTC the triggering production state changed.
+2. record existed in desktop DNS view but not prod-2 private zone.
+3. Mechanically, different resolvers backed by different zone views gave different truth.
+4. Therefore `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero`.
+5. Trace `09f92f3577b34da6a3ce929d0e0e0009` showed `A 7ms -> DNS 5ms NXDOMAIN; no connection/B span`.
+6. It selected log evidence `UnknownHostException from nameserver 10.96.0.10`.
+7. The safe failed/control comparison showed `laptop 10.70.8.12; pod NXDOMAIN`.
+8. That explains the customer scope: corporate laptops resolve; prod-2 pods return NXDOMAIN.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
+
+## Mitigation is not root cause
+
+**Mitigation:** I publish approved record in production private zone.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
+
+**Root cause:** record existed in desktop DNS view but not prod-2 private zone.
+It lives at `DNS view and resolver context` and explains why different resolvers backed by different zone views gave different truth.
+A workaround that clears current state does not correct this mechanism.
+
+## Permanent correction
+
+The primary fix is to manage views as code and test from every consumer network.
+I apply only controls supported by the incident evidence:
+
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
+
+## Verification of recovery
+
+The incident-specific target is: approved answer/TTL and authenticated call from A.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
+
+## Recurrence prevention
+
+I alert on business SLO plus `laptop answer 10.70.8.12 in 8ms; pod NXDOMAIN 5ms; A TCP attempts zero` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
+
+## Interview-ready answer
+
+> I would reproduce the lookup from Service A rather than rely on my laptop. Here the laptop used resolver `10.1.0.53` and returned `10.70.8.12`, while A used `10.96.0.10` and received NXDOMAIN in 5 ms. Because A never obtained an address, TCP, TLS, gateway, and B metrics had no failed-request samples. The record existed only in the corporate desktop DNS view; the production private zone had been omitted during launch. I published the approved production record instead of hard-coding an IP. The permanent fix managed both views as code and added source-specific DNS and business synthetics. I verified the expected address and TTL from A, then confirmed authenticated API and reservation success from each consumer environment.
 
 ---
 
-# 21. Production Debugging Workflow
+# Incident 10: Gateway 502 Traces to Upstream TLS
 
-Use this order during an incident:
+## Interview question
 
-1. **Protect users and data.** Drain a bad instance, stop unsafe retries, or reduce load through approved controls when necessary.
-2. **Record evidence.** Exact error, time, request ID, source, destination, route, change timeline.
-3. **Classify the failing stage.** Configuration, DNS, TCP, TLS, HTTP, gateway, application, dependency, response.
-4. **Reproduce from the correct boundary.** Same environment and path as Service A.
-5. **Narrow by scope.** All versus some sources, targets, endpoints, tenants, zones, or times.
-6. **Form one testable hypothesis.** Example: "B3's listener closes before load-balancer draining completes."
-7. **Collect evidence that can disprove it.** Compare healthy and failing instances and packet/request timelines.
-8. **Apply the smallest safe correction.**
-9. **Verify the original failure path and business transaction.**
-10. **Monitor for recurrence and secondary effects.**
-11. **Document root cause, contributing factors, detection gap, and prevention.**
+> Service A receives HTTP 502 from the API Gateway. How would you investigate?
 
-## Root cause versus contributing factors
+## The page arrives
 
-Example:
+At 18:03 UTC on 2026-09-13, Gateway 502 traces to upstream TLS.
+The first failed request is `ord-249bc0`, trace `0af92f3577b34da6a3ce929d0e0e000a`, from `order-a-4.18.2-k2m5q` toward `10.42.7.19:8443` and target label `inventory-b-2`.
+The measured scope is gateway gw-2 and B-2; direct correct-SNI HTTPS succeeds.
+The first metric sentence is: gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
+
+## What I do in the first five minutes
+
+### Minute 0-1: make the symptom exact
+
+I write `18:03 UTC | request=ord-249bc0 | source=order-a-4.18.2-k2m5q | target=10.42.7.19:8443 | scope=gateway gw-2 and B-2; direct correct-SNI HTTPS succeeds`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
+
+### Minute 1-2: define the blast radius
+
+I split the dataset until I can state: gateway gw-2 and B-2; direct correct-SNI HTTPS succeeds.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
+
+### Minute 2-3: open the exact dashboard
+
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `gateway-to-B TLS; Envoy generated 502`, but it remains a hypothesis.
+
+### Minute 3-4: count across boundaries
+
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
+
+### Minute 4-5: preserve evidence
+
+I save trace `0af92f3577b34da6a3ce929d0e0e000a`, sanitized logs for `ord-249bc0`, target `inventory-b-2`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
+
+## Metric-by-metric causal walk
+
+### Establish who generated the 502
+
+At 18:03 UTC A receives 48 HTTP 502 responses/s. The response carries `server: envoy`, request ID `ord-249bc0`, and `x-envoy-response-flags: UF`; A itself did not synthesize it, and B has no matching HTTP access record. In this Envoy configuration, `UF` means upstream connection failure. Another gateway may use 502 differently, so I use this product's documented flag and log.
+
+Business demand is steady. A DNS, TCP, and TLS to `gateway.internal` remain normal, and gateway downstream duration is 24 ms. That proves A reached the gateway and received its error quickly. I now switch observation point from downstream to Envoy's B-facing upstream.
+
+### Split gateway upstream phases by backend
+
+Gateway upstream connect to B-2 completes in 9 ms. Refusals and connect timeouts are zero, so the B socket is reachable. Upstream TLS handshake then fails in 11 ms with `SAN_mismatch`, exactly 48/s. No upstream HTTP request or response-time sample exists after that failure.
+
+The error follows B-2 after certificate rotation `cert-447`; other targets remain healthy. Gateway SNI is `inventory.default`, while B-2 presents a certificate for `inventory.shop.svc`. Expiry is normal, and the chain is trusted, narrowing the failure to hostname identity rather than age or CA.
+
+Target health stays green because its probe uses plaintext port 8080, so it cannot validate production TLS on 8443. Active gateway connections to B-2 fall, new connection attempts rise, and no reusable TLS session survives the rotation. If reused sessions worked while only new handshakes failed, that would explain a gradual onset; here the rotation closed old sessions, producing an immediate spike.
+
+### Direct-versus-gateway comparison
+
+From an approved gateway-equivalent context, direct HTTPS with SNI `inventory.shop.svc` succeeds and reaches B-2 in 37 ms. Repeating with Envoy's effective SNI `inventory.default` returns `hostname mismatch`. Direct success does not clear the gateway path; it proves B can serve when the client presents the intended name.
+
+B server rate for failed IDs is zero, and B CPU, queue, GC, HTTP/DB pools, DB/cache/C metrics remain normal. A retry could select another target, but attempts/order has already risen to 1.21, so more retries would hide the defect and increase load. The breaker is still closed because the aggregate cluster has healthy peers.
+
+The chain is therefore A-to-gateway success, gateway-to-B TCP success, upstream TLS identity failure, then Envoy-generated 502. Restoring the known-good SNI binding removes the TLS errors and makes B HTTP counts rise by the same amount.
+
+## Trace: follow parent to the failing child
+
+I search trace `0af92f3577b34da6a3ce929d0e0e000a` and start at the A server parent.
+The failed waterfall reads `A 31ms -> gateway 24ms 502 UF -> TCP 9ms -> TLS 11ms ERROR; no B span`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-249bc0`, `source=order-a-4.18.2-k2m5q`, `backend=inventory-b-2`, and `server.address=10.42.7.19:8443` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `UF upstream_transport_failure_reason=TLS_error:SAN_mismatch`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
 
 ```text
-Root cause:
-  New release used the wrong Service targetPort.
-
-Contributing factors:
-  Readiness checked a separate management port.
-  Deployment allowed all old pods to terminate before new pods were usable.
-  Alerting watched pod Running state instead of healthy backend count.
-
-Mitigation:
-  Roll back release.
-
-Permanent corrections:
-  Fix targetPort.
-  Test Service-to-pod wiring in deployment validation.
-  Make readiness represent traffic port.
-  Add healthy-target-count alert.
+2026-09-13T18:03:22.417Z level=ERROR request_id=ord-249bc0 trace_id=0af92f3577b34da6a3ce929d0e0e000a
+source_instance=order-a-4.18.2-k2m5q backend=inventory-b-2 target=10.42.7.19:8443
+message="UF upstream_transport_failure_reason=TLS_error:SAN_mismatch"
 ```
 
-"Restarted the pod" is a mitigation unless the reason a restart repaired the state is understood.
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
+
+## Safe config, runtime, network, and direct-path test
+
+The exact next test is to compare gateway logs/metrics with direct call using exact gateway SNI.
+I run one or a few bounded probes from A's real execution context and one matched control.
+
+```text
+FAIL request=ord-249bc0 source=order-a-4.18.2-k2m5q target=10.42.7.19:8443
+RESULT server envoy; flags UF; SAN_mismatch
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
+```
+
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
+
+### Result branches
+
+| Test result | Interpretation | Next evidence |
+|---|---|---|
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
+
+## Alternate branches kept alive
+
+The symptom can have several causes; I reject each only with boundary evidence.
+
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
+
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
+
+## Fully worked causal chain
+
+1. At 18:03 UTC the triggering production state changed.
+2. gateway SNI inventory.default mismatched B-2 renewed SAN inventory.shop.svc.
+3. Mechanically, gateway completed TCP then rejected B identity before HTTP.
+4. Therefore `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero`.
+5. Trace `0af92f3577b34da6a3ce929d0e0e000a` showed `A 31ms -> gateway 24ms 502 UF -> TCP 9ms -> TLS 11ms ERROR; no B span`.
+6. It selected log evidence `UF upstream_transport_failure_reason=TLS_error:SAN_mismatch`.
+7. The safe failed/control comparison showed `server envoy; flags UF; SAN_mismatch`.
+8. That explains the customer scope: gateway gw-2 and B-2; direct correct-SNI HTTPS succeeds.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
+
+## Mitigation is not root cause
+
+**Mitigation:** I restore known-good gateway SNI/certificate binding.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
+
+**Root cause:** gateway SNI inventory.default mismatched B-2 renewed SAN inventory.shop.svc.
+It lives at `gateway-to-B TLS; Envoy generated 502` and explains why gateway completed TCP then rejected B identity before HTTP.
+A workaround that clears current state does not correct this mechanism.
+
+## Permanent correction
+
+The primary fix is to stage overlapping cert rotation and gateway-origin TLS tests.
+I apply only controls supported by the incident evidence:
+
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
+
+## Verification of recovery
+
+The incident-specific target is: 502/TLS failures 0, B receives calls, direct/gateway both succeed.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
+
+## Recurrence prevention
+
+I alert on business SLO plus `gateway 502 48/s; upstream TLS failures 48/s; connect 9ms; B HTTP zero` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
+
+## Interview-ready answer
+
+> I would first identify the 502 generator and its product-specific subreason. At 18:03 UTC A received Envoy responses with flag `UF`, while A-to-gateway DNS, TCP, and TLS were normal. Envoy connected to B-2 in 9 ms, but its upstream TLS handshake failed with `SAN_mismatch`; B received no HTTP request. A direct call succeeded with SNI `inventory.shop.svc`, whereas the gateway's effective SNI, `inventory.default`, failed. Certificate rotation `cert-447` had exposed that mismatch. I restored the known-good gateway SNI binding to mitigate impact, then aligned the certificate and gateway configuration and added gateway-origin TLS tests with overlapping rotation. I verified zero 502 and TLS failures, matching gateway and B request counts, successful direct and gateway paths, normal retries, and restored business success.
 
 ---
 
-# 22. Common Interview Mistakes
+# Incident 11: Gateway 503 Means Zero Healthy Targets
 
-## Mistake 1 - "I will check the logs"
+## Interview question
 
-Better:
+> Service A receives HTTP 503 from the Gateway. What could be the cause?
 
-> I will inspect Service A's complete root exception and use it to decide whether to test DNS, TCP, TLS, HTTP, or post-connection processing.
+## The page arrives
 
-## Mistake 2 - "Connection refused means B is down"
+At 19:20 UTC on 2026-09-13, Gateway 503 means zero healthy targets.
+The first failed request is `ord-2f4d72`, trace `0bf92f3577b34da6a3ce929d0e0e000b`, from `order-a-4.18.2-k2m5q` toward `gateway.internal:443` and target label `inventory-b-7.6-v2m8s`.
+The measured scope is all Inventory routes after B 7.6; direct pod port 8080 works.
+The first metric sentence is: 503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
 
-Better:
+## What I do in the first five minutes
 
-> It commonly means the selected destination actively rejected the port. I will check host, port, listener, bind address, target registration, container/service mapping, and explicit reject rules.
+### Minute 0-1: make the symptom exact
 
-## Mistake 3 - "Ping works, so the network is fine"
+I write `19:20 UTC | request=ord-2f4d72 | source=order-a-4.18.2-k2m5q | target=gateway.internal:443 | scope=all Inventory routes after B 7.6; direct pod port 8080 works`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
 
-Better:
+### Minute 1-2: define the blast radius
 
-> Ping tests ICMP. I will test the actual TCP port and then TLS and HTTP from Service A.
+I split the dataset until I can state: all Inventory routes after B 7.6; direct pod port 8080 works.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
 
-## Mistake 4 - "Increase the timeout"
+### Minute 2-3: open the exact dashboard
 
-Better:
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `gateway target health; gateway generated 503`, but it remains a hypothesis.
 
-> I will identify where the time is spent and correct queueing, pool, query, dependency, resource, or retry behavior. I will change the timeout only if the valid service objective requires it.
+### Minute 3-4: count across boundaries
 
-## Mistake 5 - "Health is green, so B is healthy"
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
 
-Better:
+### Minute 4-5: preserve evidence
 
-> I will identify exactly what the health endpoint checks and test the real business path and dependencies.
+I save trace `0bf92f3577b34da6a3ce929d0e0e000b`, sanitized logs for `ord-2f4d72`, target `inventory-b-7.6-v2m8s`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
 
-## Mistake 6 - Testing only from a laptop
+## Metric-by-metric causal walk
 
-Better:
+### Identify the 503 generator before interpreting it
 
-> I will reproduce from Service A's runtime because DNS, routes, proxy, policies, trust, and identity differ.
+At 19:20 UTC A receives 503 in 4-7 ms for every Inventory route. The response carries Envoy's `UH` flag and gateway instance ID; in this deployment `UH` means no healthy upstream. A 503 generated by B, a maintenance policy, a circuit breaker, or another gateway product could mean something else, so status alone is insufficient.
 
-## Mistake 7 - Restarting before collecting evidence
+A-to-gateway DNS, TCP, TLS, and pool acquisition remain normal. A's request rate is unchanged and gateway downstream 503 count equals it. The short, flat duration proves the gateway rejects immediately rather than waiting for B.
 
-Better:
+### Target eligibility explains the absent upstream request
 
-> I will mitigate impact safely, preserve the failing instance's evidence, and determine why replacement or restart changes the condition.
+`healthy_target_count{cluster="inventory"}` drops from three to zero as the final old B target drains at 19:18:32. `unhealthy_target_count{reason="connection_refused"}` rises to three, and every reason names health-check port 8081. Gateway upstream request, connect, and response counters are zero because Envoy does not select an ineligible target.
 
-## Mistake 8 - Listing every possible cause without narrowing
+B 7.6 pods are Running and ready according to Kubernetes. Direct calls to each pod on 8080 return a real reservation response in 118-134 ms. Direct calls to 8081 refuse in 2 ms. That comparison proves the application listener works but the configured gateway probe points at a closed port.
 
-Better:
+If health checks timed out instead of refusing, I would inspect network path or an overloaded probe handler. If checks returned 404, I would inspect the path. If targets were healthy but 503 carried an overflow or circuit-breaker flag, I would inspect gateway saturation and policy. Here `connection_refused:8081` selects the port contract.
 
-> I will use the exact error, scope, hop, and success/failure comparison to select the next test and eliminate fault domains.
+### Connections, B resources, and dependencies
+
+Gateway active upstream connections fall to zero and no new connection is attempted for user traffic. Retrying at A only produces another immediate 503, so attempts/request begins to rise without reaching B. I suppress unnecessary retries within the existing policy rather than increasing them.
+
+B server rate contains only direct probes; CPU is 27%, worker queue zero, heap 52%, GC normal, and HTTP/DB pools have idle capacity. DB, cache, and Pricing C are healthy. Adding B replicas would create more healthy applications that the same wrong probe marks unhealthy.
+
+The rollout diff shows B's management listener moved from 8081 to 8080, while gateway health configuration stayed unchanged. Correcting the health port returns targets one at a time; I wait for each real business probe before restoring full traffic.
+
+## Trace: follow parent to the failing child
+
+I search trace `0bf92f3577b34da6a3ce929d0e0e000b` and start at the A server parent.
+The failed waterfall reads `A 9ms -> gateway 5ms 503 UH; no upstream attempt/B span`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-2f4d72`, `source=order-a-4.18.2-k2m5q`, `backend=inventory-b-7.6-v2m8s`, and `server.address=gateway.internal:443` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `503 response_flags=UH healthy_hosts=0`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
+
+```text
+2026-09-13T19:20:22.417Z level=ERROR request_id=ord-2f4d72 trace_id=0bf92f3577b34da6a3ce929d0e0e000b
+source_instance=order-a-4.18.2-k2m5q backend=inventory-b-7.6-v2m8s target=gateway.internal:443
+message="503 response_flags=UH healthy_hosts=0"
+```
+
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
+
+## Safe config, runtime, network, and direct-path test
+
+The exact next test is to compare target health reason and configured port to listeners.
+I run one or a few bounded probes from A's real execution context and one matched control.
+
+```text
+FAIL request=ord-2f4d72 source=order-a-4.18.2-k2m5q target=gateway.internal:443
+RESULT unhealthy ConnectionRefused 8081; LISTEN 8080
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
+```
+
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
+
+### Result branches
+
+| Test result | Interpretation | Next evidence |
+|---|---|---|
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
+
+## Alternate branches kept alive
+
+The symptom can have several causes; I reject each only with boundary evidence.
+
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
+
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
+
+## Fully worked causal chain
+
+1. At 19:20 UTC the triggering production state changed.
+2. health-check port remained 8081 after B management listener moved to 8080.
+3. Mechanically, gateway removed every target and rejected without upstream attempt.
+4. Therefore `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081`.
+5. Trace `0bf92f3577b34da6a3ce929d0e0e000b` showed `A 9ms -> gateway 5ms 503 UH; no upstream attempt/B span`.
+6. It selected log evidence `503 response_flags=UH healthy_hosts=0`.
+7. The safe failed/control comparison showed `unhealthy ConnectionRefused 8081; LISTEN 8080`.
+8. That explains the customer scope: all Inventory routes after B 7.6; direct pod port 8080 works.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
+
+## Mitigation is not root cause
+
+**Mitigation:** I restore correct health port or roll back rollout.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
+
+**Root cause:** health-check port remained 8081 after B management listener moved to 8080.
+It lives at `gateway target health; gateway generated 503` and explains why gateway removed every target and rejected without upstream attempt.
+A workaround that clears current state does not correct this mechanism.
+
+## Permanent correction
+
+The primary fix is to derive check port from service contract and canary target health.
+I apply only controls supported by the incident evidence:
+
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
+
+## Verification of recovery
+
+The incident-specific target is: healthy targets 3, 503 0, balanced business calls.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
+
+## Recurrence prevention
+
+I alert on business SLO plus `503 100% in 4-7ms; healthy targets 3 to 0; checks refused on 8081` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
+
+## Interview-ready answer
+
+> I would determine who generated the 503 and read that product's subreason. At 19:20 UTC Envoy returned `UH` in 4-7 ms, meaning no healthy upstream in this configuration. Its healthy-target count had fallen from three to zero, and every health check was refused on port 8081. Direct business calls to all B 7.6 pods on port 8080 succeeded, so B was serving but the gateway's probe contract was stale. I corrected the health-check port to mitigate impact rather than forcing targets healthy. The permanent fix derived the probe from the service contract and blocked rollouts that would reduce healthy targets to zero. I verified three eligible targets, balanced gateway traffic, zero 503 responses, normal retries, and successful direct and gateway reservation checks.
 
 ---
 
-# 23. Reusable Interview Answer Template
+# Incident 12: Gateway 504 Finds a Missing Index
 
-For most service-to-service incidents:
+## Interview question
 
-> First, I would capture the exact exception or HTTP response, timestamp, request ID, affected scope, effective URL, and the component that generated the error. I would map the call path and classify whether failure occurs in configuration, DNS, TCP, TLS, gateway routing, HTTP handling, application processing, or a downstream dependency. I would reproduce from Service A's actual runtime environment and test each layer independently. I would correlate logs, metrics, and traces by source and destination instance, compare successful and failed requests, and check recent deployments or configuration/network changes. I would use that evidence to prove one root cause, apply the smallest safe fix, retest the original business path across all instances, monitor the relevant latency/error/saturation metrics, and add a preventive control.
+> Service A receives HTTP 504 from the Gateway. How would you investigate?
 
-Customize the middle of this answer to the exact symptom:
+## The page arrives
+
+At 20:07 UTC on 2026-09-13, Gateway 504 finds a missing index.
+The first failed request is `ord-35d218`, trace `0cf92f3577b34da6a3ce929d0e0e000c`, from `order-a-4.18.2-k2m5q` toward `10.42.7.18:8080` and target label `inventory-b-r8x2p`.
+The measured scope is SKU family 88 writes; direct calls return 200 only after 4.9s.
+The first metric sentence is: 504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
+
+## What I do in the first five minutes
+
+### Minute 0-1: make the symptom exact
+
+I write `20:07 UTC | request=ord-35d218 | source=order-a-4.18.2-k2m5q | target=10.42.7.18:8080 | scope=SKU family 88 writes; direct calls return 200 only after 4.9s`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
+
+### Minute 1-2: define the blast radius
+
+I split the dataset until I can state: SKU family 88 writes; direct calls return 200 only after 4.9s.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
+
+### Minute 2-3: open the exact dashboard
+
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `B DB surfaced as gateway-generated 504`, but it remains a hypothesis.
+
+### Minute 3-4: count across boundaries
+
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
+
+### Minute 4-5: preserve evidence
+
+I save trace `0cf92f3577b34da6a3ce929d0e0e000c`, sanitized logs for `ord-35d218`, target `inventory-b-r8x2p`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
+
+## Metric-by-metric causal walk
+
+### Use the three-second shape to identify the waiting component
+
+At 20:07 UTC A receives 27 HTTP 504 responses/s after 3.000 seconds. Envoy headers and response flag `UT` identify the gateway as generator; for this product, `UT` means upstream request timeout. A 504 does not by itself prove B was down or identify why B was slow.
+
+Order demand remains normal, and only SKU family 88 is affected. A-to-gateway DNS, TCP, TLS, and pool acquisition remain below 20 ms. Gateway upstream connect to B is 8 ms, but upstream response time crosses the configured three-second budget. That contrast moves the search beyond connection setup.
+
+### Compare gateway and direct B behavior
+
+B receives every failed request and continues processing after the gateway returns 504. Direct calls that bypass the gateway eventually return 200 in about 4.9 seconds. Direct success is not acceptable performance; it confirms that the gateway timeout exposes a slower B operation rather than a gateway connection failure.
+
+Healthy-target count remains eight, no upstream reset occurs, active connections are normal, and retry attempts rise to 1.18 per order. Retrying a five-second query inside a three-second budget cannot help and increases DB work, so I contain retries while diagnosing.
+
+B p50 stays 132 ms, but p99 reaches 4.92 s only for SKU family 88. In-flight requests rise as slow work accumulates. Worker queue is 18, CPU 46%, throttling zero, heap 58%, and GC max 31 ms; runtime pressure is secondary, not the original five-second owner.
+
+### Pool and database waterfall
+
+DB pool acquisition is 14 ms with idle connections available. The failed B span contains a `SELECT stock` child of 4.71 s; cache and Pricing C children are normal. Database lock wait is low, so this differs from Incident 4. Query metric fingerprint `9ac2` shows 8.2 million rows examined and a sequential scan.
+
+A read-only `EXPLAIN` comparison shows `Seq Scan stock rows=8,204,331 duration=4.71s`; the known-good plan uses `idx_stock_sku_warehouse` in 23 ms. Migration `2026.09.13` omitted that index. If lock wait dominated, I would find a blocker; if pool acquisition dominated, I would find slow holders. Neither branch fits these values.
+
+The missing index makes B exceed Envoy's deadline, and missing cancellation lets DB work continue after A has already received 504. Raising the gateway timeout would hide the symptom while increasing concurrency. I use the prior compatible query path as mitigation, then deploy the reviewed index and cancellation fix.
+
+## Trace: follow parent to the failing child
+
+I search trace `0cf92f3577b34da6a3ce929d0e0e000c` and start at the A server parent.
+The failed waterfall reads `A 3.02s -> gateway 3s 504 UT -> B 4.92s -> DB SELECT 4.71s`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-35d218`, `source=order-a-4.18.2-k2m5q`, `backend=inventory-b-r8x2p`, and `server.address=10.42.7.18:8080` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `UT; slow_query fingerprint=9ac2 duration_ms=4712`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
 
 ```text
-Refused       -> listener, host, port, bind, target
-Connect time  -> routes, drops, policies, NAT, handshake
-Read time     -> queue, code, pools, DB, downstream, response
-502           -> gateway-to-upstream DNS/TCP/TLS/protocol/response
-503           -> generator, healthy capacity, readiness, overload
-504           -> timeout owner, latency waterfall, deadline budget
-Intermittent  -> compare dimensions and instances
-Health green  -> compare health contract with business path
+2026-09-13T20:07:22.417Z level=ERROR request_id=ord-35d218 trace_id=0cf92f3577b34da6a3ce929d0e0e000c
+source_instance=order-a-4.18.2-k2m5q backend=inventory-b-r8x2p target=10.42.7.18:8080
+message="UT; slow_query fingerprint=9ac2 duration_ms=4712"
 ```
 
-The strongest interview answers do not merely list tools. They explain:
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
 
-1. What the symptom proves.
-2. What it does not prove.
-3. Where the issue can occur.
-4. Which test comes next and why.
-5. How the result changes the next step.
-6. How the root cause is fixed and recurrence is prevented.
+## Safe config, runtime, network, and direct-path test
+
+The exact next test is to open 504 trace then compare read-only EXPLAIN with known-good plan.
+I run one or a few bounded probes from A's real execution context and one matched control.
+
+```text
+FAIL request=ord-35d218 source=order-a-4.18.2-k2m5q target=10.42.7.18:8080
+RESULT Seq Scan 8,204,331 rows 4.71s; expected Index Scan 23ms
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
+```
+
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
+
+### Result branches
+
+| Test result | Interpretation | Next evidence |
+|---|---|---|
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
+
+## Alternate branches kept alive
+
+The symptom can have several causes; I reject each only with boundary evidence.
+
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
+
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
+
+## Fully worked causal chain
+
+1. At 20:07 UTC the triggering production state changed.
+2. migration omitted idx_stock_sku_warehouse, scanning 8.2M rows.
+3. Mechanically, B exceeded gateway budget in a full scan while cancelled work continued.
+4. Therefore `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues`.
+5. Trace `0cf92f3577b34da6a3ce929d0e0e000c` showed `A 3.02s -> gateway 3s 504 UT -> B 4.92s -> DB SELECT 4.71s`.
+6. It selected log evidence `UT; slow_query fingerprint=9ac2 duration_ms=4712`.
+7. The safe failed/control comparison showed `Seq Scan 8,204,331 rows 4.71s; expected Index Scan 23ms`.
+8. That explains the customer scope: SKU family 88 writes; direct calls return 200 only after 4.9s.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
+
+## Mitigation is not root cause
+
+**Mitigation:** I route to prior compatible query path and reduce batch load.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
+
+**Root cause:** migration omitted idx_stock_sku_warehouse, scanning 8.2M rows.
+It lives at `B DB surfaced as gateway-generated 504` and explains why B exceeded gateway budget in a full scan while cancelled work continued.
+A workaround that clears current state does not correct this mechanism.
+
+## Permanent correction
+
+The primary fix is to deploy reviewed index, plan regression test, and deadline cancellation.
+I apply only controls supported by the incident evidence:
+
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
+
+## Verification of recovery
+
+The incident-specific target is: query p99 <80ms, 504 0, cancellation and reconciliation pass.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
+
+## Recurrence prevention
+
+I alert on business SLO plus `504 27/s pinned 3s; upstream response >3s; connect 8ms; B continues` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
+
+## Interview-ready answer
+
+> I would identify the 504 generator and compare connect time with upstream response time. Here Envoy returned `UT` exactly at its three-second upstream deadline. Connection to B took 8 ms, B received the request, and a direct call eventually returned 200 after 4.9 seconds. The B trace placed 4.71 seconds in database query fingerprint `9ac2`; pool acquisition and lock wait were normal, while the query scanned 8.2 million rows. Migration `2026.09.13` had omitted the expected index. I routed the affected operation through the prior compatible query path to mitigate impact. I then deployed the reviewed index, added plan regression tests, and propagated cancellation. I verified query p99 below 80 ms, zero 504 responses, normal attempts per order, stopped cancelled work, and reconciled business results.
+
+---
+
+# Incident 13: One Pod Fails Through GC
+
+## Interview question
+
+> Only one instance of Service B is failing while other instances work. How would you identify the problem?
+
+## The page arrives
+
+At 21:02 UTC on 2026-09-13, one pod fails through GC.
+The first failed request is `ord-469f81`, trace `0df92f3577b34da6a3ce929d0e0e000d`, from `order-a-4.18.2-p8t6d` toward `10.42.7.27:8080` and target label `inventory-b-7`.
+The measured scope is B-7 only; identical traffic succeeds on B-1 through B-6.
+The first metric sentence is: B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
+
+## What I do in the first five minutes
+
+### Minute 0-1: make the symptom exact
+
+I write `21:02 UTC | request=ord-469f81 | source=order-a-4.18.2-p8t6d | target=10.42.7.27:8080 | scope=B-7 only; identical traffic succeeds on B-1 through B-6`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
+
+### Minute 1-2: define the blast radius
+
+I split the dataset until I can state: B-7 only; identical traffic succeeds on B-1 through B-6.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
+
+### Minute 2-3: open the exact dashboard
+
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `B-7 runtime/configuration`, but it remains a hypothesis.
+
+### Minute 3-4: count across boundaries
+
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
+
+### Minute 4-5: preserve evidence
+
+I save trace `0df92f3577b34da6a3ce929d0e0e000d`, sanitized logs for `ord-469f81`, target `inventory-b-7`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
+
+## Metric-by-metric causal walk
+
+### Let the failure fraction suggest, not prove, one instance
+
+At 21:02 UTC fleet reservation errors are about 12%, close to one of eight evenly weighted B instances. I split by `service.instance.id` and backend rather than treating probability as proof. B-7 has 100% of the slow failures; B-1 through B-6 remain below 160 ms for matched requests.
+
+The same A versions, routes, payload classes, and zones succeed when routed elsewhere. DNS answers, TCP connect at 8 ms, TLS at 13 ms, and gateway upstream connect are normal to B-7. Target health remains green because the lightweight probe happens between pauses.
+
+A's client total pins at five seconds only for B-7. B-7's server span continues to 6.17 seconds, while its DB children total 91 ms. That rejects a shared DB query and leaves a 5.81-second gap inside B's runtime.
+
+### Compare runtime and configuration with a healthy peer
+
+B-7 CPU average is not exceptional, but heap is 96% versus B-6 at 54%. GC maximum jumps to 5.812 seconds with `Pause Full (Allocation Failure)`. A stop-the-world pause explains both the uninstrumented trace gap and why active requests make no progress despite normal dependency spans.
+
+B-7 worker queue spikes during the pause and drains afterward; threads are not permanently maxed, and rejected count remains zero. HTTP and DB pools look active during the freeze because holders cannot run, but acquisition returns to normal immediately afterward. Increasing either pool would retain more paused work and memory.
+
+Network bytes, retransmissions, and resets are normal. Retry attempts disproportionately hit healthy peers and raise their load from 31% to 44%; I account for that headroom before draining B-7. The circuit breaker is slow to open because pauses are intermittent.
+
+Per-instance metadata reveals the same image version but a different config hash and node. B-7 alone has `FEATURE_PRELOAD_CATALOG=true` from a stale node-local injection and loaded a 3.4 GB snapshot. B-6 has `false`. If config matched but one node showed throttling or packet loss, I would pursue the node branch; if all new-version pods showed the pause, I would pursue the rollout.
+
+I preserve GC logs, effective environment, heap summary, node identity, and traces before removing B-7 from service. Replacement without that preservation would recover traffic but destroy the explanation. The known-good configuration keeps heap below 65% and removes full pauses.
+
+## Trace: follow parent to the failing child
+
+I search trace `0df92f3577b34da6a3ce929d0e0e000d` and start at the A server parent.
+The failed waterfall reads `A 5s ERROR -> B-7 6.17s with 5.81s uninstrumented gap; DB 91ms`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-469f81`, `source=order-a-4.18.2-p8t6d`, `backend=inventory-b-7`, and `server.address=10.42.7.27:8080` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `Pause Full Allocation Failure 5812ms heap_after=3050MiB`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
+
+```text
+2026-09-13T21:02:22.417Z level=ERROR request_id=ord-469f81 trace_id=0df92f3577b34da6a3ce929d0e0e000d
+source_instance=order-a-4.18.2-p8t6d backend=inventory-b-7 target=10.42.7.27:8080
+message="Pause Full Allocation Failure 5812ms heap_after=3050MiB"
+```
+
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
+
+## Safe config, runtime, network, and direct-path test
+
+The exact next test is to compare B-7 version/config/node/heap/GC with B-6.
+I run one or a few bounded probes from A's real execution context and one matched control.
+
+```text
+FAIL request=ord-469f81 source=order-a-4.18.2-p8t6d target=10.42.7.27:8080
+RESULT B-7 preload=true heap96%; B-6 false heap54%
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
+```
+
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
+
+### Result branches
+
+| Test result | Interpretation | Next evidence |
+|---|---|---|
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
+
+## Alternate branches kept alive
+
+The symptom can have several causes; I reject each only with boundary evidence.
+
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
+
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
+
+## Fully worked causal chain
+
+1. At 21:02 UTC the triggering production state changed.
+2. B-7 alone loaded 3.4GB snapshot via stale FEATURE_PRELOAD_CATALOG=true.
+3. Mechanically, heap pressure caused stop-the-world full GC while peers remained normal.
+4. Therefore `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8`.
+5. Trace `0df92f3577b34da6a3ce929d0e0e000d` showed `A 5s ERROR -> B-7 6.17s with 5.81s uninstrumented gap; DB 91ms`.
+6. It selected log evidence `Pause Full Allocation Failure 5812ms heap_after=3050MiB`.
+7. The safe failed/control comparison showed `B-7 preload=true heap96%; B-6 false heap54%`.
+8. That explains the customer scope: B-7 only; identical traffic succeeds on B-1 through B-6.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
+
+## Mitigation is not root cause
+
+**Mitigation:** I drain B-7 after preserving GC/config evidence.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
+
+**Root cause:** B-7 alone loaded 3.4GB snapshot via stale FEATURE_PRELOAD_CATALOG=true.
+It lives at `B-7 runtime/configuration` and explains why heap pressure caused stop-the-world full GC while peers remained normal.
+A workaround that clears current state does not correct this mechanism.
+
+## Permanent correction
+
+The primary fix is to remove node injection, enforce config hashes, and bound preload memory.
+I apply only controls supported by the incident evidence:
+
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
+
+## Verification of recovery
+
+The incident-specific target is: every target p99 <200ms, heap <65%, GC p99 <50ms.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
+
+## Recurrence prevention
+
+I alert on business SLO plus `B-7 p99 6.2s vs 160ms; GC max 5.8s; heap 96%; fleet errors 1/8` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
+
+## Interview-ready answer
+
+> I would start with the failure fraction and then prove the target correlation. About 12% of calls failed, and every one selected B-7; matched calls to the other instances succeeded. DNS, TCP, TLS, gateway connect, and B's dependency spans were normal, but B-7's trace contained a 5.81-second gap. Its heap was 96% and the GC log showed a 5.812-second full pause. Comparing effective configuration found that only B-7 had loaded a 3.4 GB catalog snapshot from a stale node-local feature flag. I preserved the GC, heap, config, and node evidence before draining it. I removed the injection and added replica config-hash checks and memory bounds. I verified every target below 200 ms p99, heap below 65%, GC p99 below 50 ms, zero outlier errors, and safe peer capacity.
+
+---
+
+# Incident 14: Routing Finds a Stale Draining Target
+
+## Interview question
+
+> Requests routed to one particular Service B instance are failing. What could cause this?
+
+## The page arrives
+
+At 22:13 UTC on 2026-09-13, routing finds a stale draining target.
+The first failed request is `ord-57d108`, trace `0ef92f3577b34da6a3ce929d0e0e000e`, from `order-a-4.18.2-k2m5q` toward `10.42.7.26:8080` and target label `inventory-b-6`.
+The measured scope is LB-routed B-6 only; current endpoints and B-9 direct calls succeed.
+The first metric sentence is: B-6 100% resets on reused connections; draining 27m; error share equals weight.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
+
+## What I do in the first five minutes
+
+### Minute 0-1: make the symptom exact
+
+I write `22:13 UTC | request=ord-57d108 | source=order-a-4.18.2-k2m5q | target=10.42.7.26:8080 | scope=LB-routed B-6 only; current endpoints and B-9 direct calls succeed`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
+
+### Minute 1-2: define the blast radius
+
+I split the dataset until I can state: LB-routed B-6 only; current endpoints and B-9 direct calls succeed.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
+
+### Minute 2-3: open the exact dashboard
+
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `load-balancer lifecycle and stale keep-alive`, but it remains a hypothesis.
+
+### Minute 3-4: count across boundaries
+
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
+
+### Minute 4-5: preserve evidence
+
+I save trace `0ef92f3577b34da6a3ce929d0e0e000e`, sanitized logs for `ord-57d108`, target `inventory-b-6`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
+
+## Metric-by-metric causal walk
+
+### Join every result to routing and connection state
+
+At 22:13 UTC 14% of requests fail, matching B-6's configured load-balancer weight. I join success and failure datasets on backend, connection ID, connection age, reuse flag, source A, gateway, zone, and rollout state. Failures follow B-6 and reused connections; new connections to replacement B-9 succeed in 88 ms.
+
+DNS no longer advertises B-6, and current EndpointSlice contains B-9 instead. That difference rules out a current multi-answer DNS problem, but it reveals disagreement between service discovery and the load balancer's target inventory.
+
+TCP connects to active targets remain 8-11 ms. Requests on old B-6 keep-alives receive resets, not connect timeouts. A reset means an existing connection was forcibly closed; a timeout would suggest dropped new handshakes. The reuse split points directly to stale pooled state during draining.
+
+### Follow target state through the rollout
+
+The load balancer reports B-6 in `draining` for 27 minutes, even though normal drain time is 60 seconds. Its routing weight remains 0.14. Controller logs show its endpoint watch disconnected at 21:45:58, four seconds before B-6 termination began. Deregistration never completed.
+
+Gateway upstream reset count for B-6 is 100% with reason `connection_termination`; B-9 has zero resets. Some first attempts retry to B-9 and succeed, raising attempts/order to 1.14 and making client-level failures depend on remaining deadline. The circuit breaker is per gateway worker, so stale connection distribution makes its state uneven.
+
+B-6 has no current server metrics because the pod has terminated. B-9 and peers show normal CPU, GC, queues, HTTP/DB pools, and dependency latency. Adding replicas cannot delete stale routing state. Before removing B-6 from the load balancer, I preserve controller watch logs, target state, connection ages, pod termination timing, and the failed/success trace pair.
+
+If failures followed one live B instance on both new and reused connections, I would inspect its config/runtime as in Incident 13. If all old connections reset across every target, I would inspect a broad rollout or keep-alive incompatibility. If DNS still returned B-6 directly, I would repair DNS/discovery as in Incident 5. Here only the load balancer inventory is stale.
+
+Removing B-6 through the approved control plane stops resets immediately. The permanent solution makes watch recovery and deregistration idempotent, and aligns readiness false, preStop, endpoint withdrawal, load-balancer drain, and application termination.
+
+## Trace: follow parent to the failing child
+
+I search trace `0ef92f3577b34da6a3ce929d0e0e000e` and start at the A server parent.
+The failed waterfall reads `LB upstream target=B-6 reused=true RESET -> retry B-9 88ms OK`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-57d108`, `source=order-a-4.18.2-k2m5q`, `backend=inventory-b-6`, and `server.address=10.42.7.26:8080` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `target_state=draining upstream_reset=connection_termination`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
+
+```text
+2026-09-13T22:13:22.417Z level=ERROR request_id=ord-57d108 trace_id=0ef92f3577b34da6a3ce929d0e0e000e
+source_instance=order-a-4.18.2-k2m5q backend=inventory-b-6 target=10.42.7.26:8080
+message="target_state=draining upstream_reset=connection_termination"
+```
+
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
+
+## Safe config, runtime, network, and direct-path test
+
+The exact next test is to join outcome to target/reuse then compare LB inventory with EndpointSlice.
+I run one or a few bounded probes from A's real execution context and one matched control.
+
+```text
+FAIL request=ord-57d108 source=order-a-4.18.2-k2m5q target=10.42.7.26:8080
+RESULT failed B-6 reused reset; success B-9 new 88ms; B-6 absent endpoint
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
+```
+
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
+
+### Result branches
+
+| Test result | Interpretation | Next evidence |
+|---|---|---|
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
+
+## Alternate branches kept alive
+
+The symptom can have several causes; I reject each only with boundary evidence.
+
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `B-6 100% resets on reused connections; draining 27m; error share equals weight` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `B-6 100% resets on reused connections; draining 27m; error share equals weight` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `B-6 100% resets on reused connections; draining 27m; error share equals weight` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `B-6 100% resets on reused connections; draining 27m; error share equals weight` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `B-6 100% resets on reused connections; draining 27m; error share equals weight` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `B-6 100% resets on reused connections; draining 27m; error share equals weight` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `B-6 100% resets on reused connections; draining 27m; error share equals weight` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `B-6 100% resets on reused connections; draining 27m; error share equals weight` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `B-6 100% resets on reused connections; draining 27m; error share equals weight` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `B-6 100% resets on reused connections; draining 27m; error share equals weight` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
+
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
+
+## Fully worked causal chain
+
+1. At 22:13 UTC the triggering production state changed.
+2. controller lost watch and failed to deregister terminating B-6.
+3. Mechanically, routing state outlived compute; pooled connections selected a closing target.
+4. Therefore `B-6 100% resets on reused connections; draining 27m; error share equals weight`.
+5. Trace `0ef92f3577b34da6a3ce929d0e0e000e` showed `LB upstream target=B-6 reused=true RESET -> retry B-9 88ms OK`.
+6. It selected log evidence `target_state=draining upstream_reset=connection_termination`.
+7. The safe failed/control comparison showed `failed B-6 reused reset; success B-9 new 88ms; B-6 absent endpoint`.
+8. That explains the customer scope: LB-routed B-6 only; current endpoints and B-9 direct calls succeed.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
+
+## Mitigation is not root cause
+
+**Mitigation:** I remove stale target via approved control after preserving evidence.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
+
+**Root cause:** controller lost watch and failed to deregister terminating B-6.
+It lives at `load-balancer lifecycle and stale keep-alive` and explains why routing state outlived compute; pooled connections selected a closing target.
+A workaround that clears current state does not correct this mechanism.
+
+## Permanent correction
+
+The primary fix is to repair idempotent watches and align preStop/readiness/drain durations.
+I apply only controls supported by the incident evidence:
+
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
+
+## Verification of recovery
+
+The incident-specific target is: B-6 absent LB, resets 0, controlled drain test passes.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
+
+## Recurrence prevention
+
+I alert on business SLO plus `B-6 100% resets on reused connections; draining 27m; error share equals weight` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
+
+## Interview-ready answer
+
+> I would correlate each failure with the selected backend and connection state. At 22:13 UTC the 14% error rate matched B-6's load-balancer weight, and every failure used a reused connection to that target. B-6 was absent from DNS and EndpointSlice but remained in the load balancer as `draining` for 27 minutes. Its connections reset, while new connections to B-9 succeeded in 88 ms. Controller logs showed that an endpoint watch had disconnected before B-6 terminated, so deregistration never completed. I preserved routing and termination evidence, then removed the stale target through the approved control plane. I fixed idempotent watch recovery and aligned readiness, preStop, deregistration, and drain timing. I verified no B-6 target or connection remained, resets were zero, retries normalized, and a controlled rollout drain passed.
+
+---
+
+# Incident 15: Green Health Hides Pool Exhaustion
+
+## Interview question
+
+> Service B is healthy according to its health endpoint, but actual API requests are failing. Why?
+
+## The page arrives
+
+At 23:04 UTC on 2026-09-13, green health hides pool exhaustion.
+The first failed request is `ord-68ef55`, trace `0ff92f3577b34da6a3ce929d0e0e000f`, from `order-a-4.18.2-k2m5q` toward `10.42.7.18:8080` and target label `inventory-b-r8x2p`.
+The measured scope is /live and /ready 200 in 3ms; business reservations fail fleet-wide.
+The first metric sentence is: health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%.
+I do not paraphrase this as 'B is down'; that would skip the failing layer.
+I preserve error text, timestamps, address, generator, attempt, reuse, timeout, and remaining deadline.
+
+## Why green health is not green business
+
+I put five separate series on one panel rather than using one green status tile.
+
+| Signal | What it asks | Observed value | Interpretation and next branch |
+|---|---|---|---|
+| Liveness `/live` | Is the B process event loop alive enough to answer? | 100% success, p99 3 ms | B should not be restarted by the platform; this says nothing about DB access |
+| Readiness `/ready` | Should this instance receive traffic under the configured probe contract? | 100% success, p99 4 ms | The implemented probe is too shallow because it checks only local startup state |
+| Startup probe | Has initialization completed within its startup budget? | Last ran at 22:42, succeeded after 11 s | It prevents premature liveness action during boot; it is not a continuous dependency test |
+| Synthetic reservation | Can a controlled user execute the real reserve workflow? | Success falls from 99.9% to 18%, p99 5.1 s | The business path is broken and selects its handler, pool, and dependencies |
+| Real business outcome | Did customer inventory reservations commit exactly once? | 22% success; attempts remain normal | Confirms customer impact and requires reconciliation after recovery |
+
+The lightweight liveness and readiness handlers allocate no DB connection, perform no stock query, and call neither Redis nor Pricing C.
+They remain fast because the event loop and local process state are healthy.
+The business handler must acquire a DB connection, so its trace waits 4.9 seconds before any query span exists.
+If readiness also used the DB pool and failed, I would still keep liveness independent to avoid a restart storm.
+If the synthetic succeeded while real traffic failed, I would compare identity, payload, tenant, warehouse, rate limit, and data shape rather than clearing the incident.
+If startup failed only on new instances, I would inspect initialization, migration, secret, and startup-budget evidence by version instead of the steady-state pool leak.
+
+## What I do in the first five minutes
+
+### Minute 0-1: make the symptom exact
+
+I write `23:04 UTC | request=ord-68ef55 | source=order-a-4.18.2-k2m5q | target=10.42.7.18:8080 | scope=/live and /ready 200 in 3ms; business reservations fail fleet-wide`.
+I acknowledge customer impact, freeze unrelated changes, assign owners, and use UTC everywhere.
+I do not restart because it can erase sockets, heap, queues, connection age, config drift, and logs.
+
+### Minute 1-2: define the blast radius
+
+I split the dataset until I can state: /live and /ready 200 in 3ms; business reservations fail fleet-wide.
+I split by route, status/exception, A source, B backend, instance, version, zone, attempt, new/reused connection, and safe business dimension.
+I pair the failure with a success from the same minute, route, payload class, source version, and identity.
+For intermittent behavior, the denominator and failure probability matter as much as a single stack trace.
+
+### Minute 2-3: open the exact dashboard
+
+I open the business outcome and service-path dashboard, not a host CPU dashboard alone.
+The shared cursor starts ten minutes before the first failure and includes deploy/config/cert/network/job annotations.
+Panels are A server RED, A client phases, DNS/TCP/TLS, gateway downstream/upstream, target health/connections, B server RED, B USE, pools, dependencies, and DB.
+The working fault domain is `B business DB pool`, but it remains a hypothesis.
+
+### Minute 3-4: count across boundaries
+
+I compare A inbound user requests, A outbound attempts, gateway receives/upstream attempts, B accepts, DB/cache/C calls, and completed reservations.
+A count mismatch identifies where work stopped; equal rates let me move deeper.
+I align status/exception and latency phases rather than comparing unrelated totals.
+
+### Minute 4-5: preserve evidence
+
+I save trace `0ff92f3577b34da6a3ce929d0e0e000f`, sanitized logs for `ord-68ef55`, target `inventory-b-r8x2p`, effective config hashes, and a matched success.
+I preserve per-instance/node/zone/version state before draining anything.
+Only then do I select a reversible mitigation supported by the evidence.
+
+## Metric-by-metric causal walk
+
+### Put health and business outcomes on the same timeline
+
+At 23:04 UTC `/live` and `/ready` remain 100% successful at 3-4 ms, but real reservation success falls to 22% and the controlled business synthetic falls to 18%. Request rate is normal. The disagreement is the starting evidence, not a paradox: each signal executes different work.
+
+The startup probe last succeeded in 11 seconds at deployment time and is no longer running. Liveness checks only the event loop. Readiness checks local initialization. Neither acquires a DB connection, reads stock, calls Redis, or reaches Pricing C. Their low latency is therefore mechanically compatible with a broken reservation handler.
+
+If liveness failed, I would investigate process scheduling, deadlock, or runtime failure. If readiness alone failed on new pods, I would inspect initialization and probe contract. If the synthetic succeeded while customer requests failed, I would compare identity, tenant, payload, data, and rate limits. Here both synthetic and real business paths fail.
+
+### Follow the real request through healthy transport
+
+A DNS, TCP, TLS, and gateway connect p99 values remain 3, 8, 14, and 7 ms. Healthy-target count stays eight, gateway status is 504 after waiting, and B receives every business request. This removes the health endpoint and network path from the critical branch.
+
+B business p99 reaches 5.1 seconds, while health p99 remains 4 ms. CPU is only 29%, throttling zero, heap 56%, and GC max 24 ms. Worker in-flight rises and queue depth grows because handlers wait; low CPU is expected for blocked acquisition rather than compute saturation.
+
+### The pool metrics reveal where work stops
+
+Across B instances the DB pool progresses from active 31/40, idle 9, pending 0 at 22:55 to active 40/40, idle 0, pending 186 at 23:04. Acquisition p99 reaches 4.9 seconds and then times out. The failed trace has `db.pool.acquire=4902 ms` and no DB query child, proving the request never obtained a connection.
+
+Database query rate falls even though B request rate is steady. DB CPU and lock waits are normal because leaked connections are checked out but not executing useful queries. Cache and Pricing C remain normal. Enlarging the pool could consume more DB sessions and only delay exhaustion.
+
+Checkout/return counters diverge after B 7.7 deployment at 22:42:17, especially on validation-error requests. A matched success in 7.6 returns its connection in a `finally` block; 7.7 returns only on the success branch. The leak accumulates across every instance, explaining why impact worsens over time rather than mapping to one target.
+
+Retries amplify pending work and are reduced within policy. The breaker opens only after acquisition failures, so it protects B late. I roll back 7.7, then drain gradually; a restart is used only after evidence capture to reclaim leaked resources, not presented as the root cause.
+
+The code correction uses scoped resource management on every exit path. A failure-path and soak test assert checkout equals return, pending remains zero, and real business synthetics pass. Liveness stays shallow to avoid restart storms, while readiness and separate deep synthetic signals have explicit, different purposes.
+
+## Trace: follow parent to the failing child
+
+I search trace `0ff92f3577b34da6a3ce929d0e0e000f` and start at the A server parent.
+The failed waterfall reads `health B 3ms no child; business B 5.1s -> pool.acquire 4.9s ERROR; no query`.
+I expand A client, gateway server/upstream, B server, queue, and dependency children in order.
+I inspect span status, exception events, route, source, resolved address, backend, instance, version, zone, attempt, reuse, and deadline.
+I expect `request.id=ord-68ef55`, `source=order-a-4.18.2-k2m5q`, `backend=inventory-b-r8x2p`, and `server.address=10.42.7.18:8080` where instrumentation supports them.
+If A client is slow but B is normal, I inspect pre-B phases and response transfer.
+If B is slow and DB child is 4.7s of 5.1s, that DB path owns observed latency and selects its fingerprint.
+If no B span exists, I investigate before B, but first confirm sampling and B access logs.
+If gateway has no upstream child and `no_healthy_upstream`, I inspect target health, not B code.
+If gateway ends at its deadline while B continues, I inspect cancellation and B's longest child.
+A blank gap can be GC, queueing, uninstrumented code, dropped spans, or clock skew; metrics/logs must account for it.
+Tracing is evidence, not guaranteed completeness.
+
+## Trace-selected logs
+
+The trace selects the narrow log evidence `pool active=40 idle=0 pending=186 acquire_timeout=5000`.
+I query a small UTC window by request/trace ID and compare the matched successful request.
+I retain source, target, version, zone, attempt, elapsed phase, and config hash, while redacting secrets and payloads.
+
+```text
+2026-09-13T23:04:22.417Z level=ERROR request_id=ord-68ef55 trace_id=0ff92f3577b34da6a3ce929d0e0e000f
+source_instance=order-a-4.18.2-k2m5q backend=inventory-b-r8x2p target=10.42.7.18:8080
+message="pool active=40 idle=0 pending=186 acquire_timeout=5000"
+```
+
+The log proves that this component emitted the record; its wording alone is not causal proof.
+I verify nested exception, elapsed phase, target, and whether adjacent access logs contain the same request.
+
+## Safe config, runtime, network, and direct-path test
+
+The exact next test is to compare health and failed business traces, pool checkout/return logs.
+I run one or a few bounded probes from A's real execution context and one matched control.
+
+```text
+FAIL request=ord-68ef55 source=order-a-4.18.2-k2m5q target=10.42.7.18:8080
+RESULT ready 3ms children0; reserve 5104ms pool.acquire4902 query0
+CONTROL same route, identity, payload class, and minute through known-good path succeeds
+```
+
+A single probe locates a layer but does not measure availability; the time series establishes scope.
+If the command bypasses A's runtime DNS cache, sidecar, gateway, identity, or pool, I state that limitation.
+I inspect effective runtime config, not only Git or deployment intent.
+
+### Result branches
+
+| Test result | Interpretation | Next evidence |
+|---|---|---|
+| Expected DNS answer quickly | DNS worked for this sample, not TCP | retain address/TTL and test exact IP/port |
+| NXDOMAIN | name absent in this resolver view | compare FQDN, search suffix, zone/view, authority |
+| SERVFAIL/timeout | resolver chain failed | compare control zones, forwarder route/health |
+| Fast refusal | selected destination actively rejected | listener, bind, port map, target lifecycle |
+| Connect timeout | handshake never completed | policy, firewall, route, flow, retransmission |
+| TCP works; TLS fails | secure identity/policy boundary | SNI, SAN, CA, client cert, protocol |
+| Gateway identity on response | intermediary generated/forwarded it | product subreason, target, upstream metrics |
+| Direct B succeeds; gateway fails | intermediary path differs | SNI, protocol, route, target, identity |
+| B span slow | B or child owns delay | queue, runtime, pool, dependencies |
+| Health works; business fails | probe bypasses failing work | auth, handler, pool, dependency, data |
+
+## Alternate branches kept alive
+
+The symptom can have several causes; I reject each only with boundary evidence.
+
+| Branch | Mechanism/shape | Deciding next test |
+|---|---|---|
+| Config | wrong scheme/host/port/path/proxy/SNI/deadline or drift; compare with `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%` | compare effective failed/good runtime config; reject if the failure/success pair conflicts |
+| DNS | NXDOMAIN/SERVFAIL/stale multi-answer/cache/split horizon; compare with `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%` | query through A resolver and correlate answer to outcome; reject if the failure/success pair conflicts |
+| Network/TCP | route/policy/firewall/refusal/loss/reset/NAT pressure; compare with `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%` | compare connect phases, listener, flow and counters; reject if the failure/success pair conflicts |
+| TLS | expiry/SAN/CA/SNI/mTLS/protocol mismatch; compare with `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%` | inspect exact handshake and effective trust; reject if the failure/success pair conflicts |
+| Gateway/LB/mesh | wrong cluster/port/protocol, health, stale target, queue/breaker; compare with `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%` | identify generator/subreason and backend; reject if the failure/success pair conflicts |
+| A client | pool pending/stale keep-alive/proxy/retry/deadline; compare with `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%` | inspect phase, reuse, attempt, remaining budget; reject if the failure/success pair conflicts |
+| B runtime | worker/CPU/GC/memory/deadlock/instance drift; compare with `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%` | split USE by instance and compare peer; reject if the failure/success pair conflicts |
+| Dependency | DB lock/scan/pool, cache miss, Service C/retry; compare with `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%` | select exact child/fingerprint; reject if the failure/success pair conflicts |
+| Contract/security | 401/403/404/429/500 from identity/route/quota/payload/code; compare with `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%` | confirm responder and sanitized decision log; reject if the failure/success pair conflicts |
+| Telemetry | sampling/missing label/clock/drop/counter reset; compare with `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%` | corroborate adjacent metrics/access logs; reject if the failure/success pair conflicts |
+
+The winning explanation must account for start time, exact scope, probability, instance shape, waterfall, log, test, and recovery.
+One abnormal chart without that chain is correlation, not root cause.
+
+## Fully worked causal chain
+
+1. At 23:04 UTC the triggering production state changed.
+2. B 7.7 returned DB connections only on success; validation failures leaked them.
+3. Mechanically, light health bypassed DB while business queued for leaked connections.
+4. Therefore `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%`.
+5. Trace `0ff92f3577b34da6a3ce929d0e0e000f` showed `health B 3ms no child; business B 5.1s -> pool.acquire 4.9s ERROR; no query`.
+6. It selected log evidence `pool active=40 idle=0 pending=186 acquire_timeout=5000`.
+7. The safe failed/control comparison showed `ready 3ms children0; reserve 5104ms pool.acquire4902 query0`.
+8. That explains the customer scope: /live and /ready 200 in 3ms; business reservations fail fleet-wide.
+9. I changed only the proven mechanism and watched the predicted metrics reverse.
+10. Business outcomes recovered with the technical layer, completing causal verification.
+
+## Mitigation is not root cause
+
+**Mitigation:** I roll back 7.7 and drain gradually; restart only after evidence to recover state.
+I first preserve evidence and confirm remaining targets/dependencies have capacity for shifted traffic.
+I do not blindly restart, increase timeout, enable more retries, enlarge pools/threads, or add replicas.
+Those actions can hide evidence, retain work longer, amplify load, or overwhelm the downstream.
+
+**Root cause:** B 7.7 returned DB connections only on success; validation failures leaked them.
+It lives at `B business DB pool` and explains why light health bypassed DB while business queued for leaked connections.
+A workaround that clears current state does not correct this mechanism.
+
+## Permanent correction
+
+The primary fix is to use scoped/finally release and test error paths plus business synthetic.
+I apply only controls supported by the incident evidence:
+
+- Config: schema validation, one source, effective hash, drift detection, and safe reload.
+- Code: deadline propagation, cancellation, resource release, bounded retry, and useful spans.
+- Platform: readiness/startup/drain contracts, stable selectors, and per-instance telemetry.
+- Network: least-privilege contract, caller-context probes, and DNS/certificate lifecycle.
+- Gateway: tested cluster, port, protocol, SNI, health policy, subreason, and target reconciliation.
+- Service/dependency: query/capacity guardrails, pool ownership, and real business synthetic coverage.
+
+## Verification of recovery
+
+The incident-specific target is: pending 0, idle available, business >99.9%, no leak under soak.
+I verify the same caller, route, identity class, and formerly failing target/path.
+I confirm business reservation success and reconciliation, not only HTTP 200 or /health.
+I confirm A error reason and every phase histogram return to baseline.
+I confirm gateway target/subreason and B/dependency rate/latency/queue/pool are stable.
+I confirm p50/p95/p99/max by instance, zone, and version for the observation window.
+I confirm attempts/request returns to normal and no hidden retry amplification remains.
+I check for duplicate, orphaned, or late reservations from retries/cancelled work.
+I execute a controlled canary/deployment test at the repaired boundary.
+Only matching technical and business recovery closes the incident.
+
+## Recurrence prevention
+
+I alert on business SLO plus `health 100%; business 22%; DB pool 40/40, idle0, pending186, acquire p99 4.9s; CPU29%` with useful route/source/target/version labels.
+I add adjacent-rate mismatch alerts such as A attempts without B accepts.
+I separate DNS, refusal, connect timeout, TLS, 502 subreason, 503 health reason, 504 timeout, read timeout, and application errors.
+I alert on per-instance p99/error outliers, queues/rejections, pool pending/acquisition, retries, and breaker rejection.
+The runbook links dashboards, safe caller-context tests, evidence preservation, owner, rollback/drain control, and numeric verification.
+Deployment tests cover DNS, TCP, TLS identity, gateway route, readiness, business dependency, deadlines, retries, and draining.
+
+## Interview-ready answer
+
+> I would compare liveness, readiness, startup, synthetic, and real business metrics instead of trusting one green tile. At 23:04 UTC liveness and readiness were 100% successful in 3-4 ms, but reservations succeeded only 22%. Transport and B runtime were healthy; the failed business trace spent 4.9 seconds acquiring a DB connection and never produced a query span. Every pool was active 40 of 40, idle zero, with 186 pending requests. Checkout and return counters diverged after B 7.7 because validation failures skipped connection release. I rolled back 7.7 and drained safely after preserving evidence; restart only reclaimed leaked state. I fixed resource handling with scoped cleanup and failure-path tests. I verified idle capacity, zero pending work, balanced checkout/return, business success above 99.9%, and a clean soak test.
+
+---
+
+# Reusable spoken interview story template
+
+> At `[UTC]`, `[alert]` showed `[exact error/status/duration]` on `[route]`.
+> In five minutes I captured `[request/trace/source/target/version/zone/attempt/deadline]`, froze unrelated changes, and scoped by `[dimensions]`.
+> Business plus layered RED/USE showed `[metric A]` changed while adjacent `[metric B]` stayed normal/flat.
+> That located the last good boundary and triggered `[exact safe test]`.
+> If `[alternate shape]` had appeared, I would have moved to `[alternate layer]` instead.
+> The failed trace showed `[waterfall]`; a matched success showed `[contrast]`.
+> The longest/failed child selected `[log/config/code/query/network evidence]`.
+> Root cause was `[mechanism at named layer]`, triggered by `[change]`.
+> Mitigation was `[reversible action]`; it was not the permanent fix.
+> I fixed `[control]`, verified the same path, business result, p95/p99, every instance, retries, and downstream capacity for `[window]`, then added `[alert/runbook/test]`.
+
+# Final combined case study: metrics to trace to code to durable recovery
+
+At 08:31 UTC on 2026-09-14, reservation success falls to 91.4% while order rate is a normal 240/s.
+A p50 is 92ms, p95 180ms, p99 5.02s, while average is only 141ms and hides the tail.
+Read timeouts are 20.6/s pinned at the five-second deadline.
+Both A versions and all eight B instances fail, but 96% of failures are warehouse 17.
+DNS p99 is 3ms with zero errors; TCP p99 9ms with no refusal/retransmit; TLS p99 14ms with zero failure.
+Gateway connect p99 is 8ms but upstream response p99 is 5.11s; eight targets stay healthy.
+A attempts and B accepts match, proving calls reach B quickly.
+B CPU is 44%, throttle zero, heap 61%, GC p99 21ms, workers 96/200, queue 4, rejected zero.
+DB pool acquisition is 11ms, but query fingerprint `9ac2` has p99 4.82s and lock wait 4.68s for warehouse 17.
+
+```text
+Order A server                                  5,008ms ERROR
+  Inventory client                              5,001ms read_timeout
+    Gateway                                     4,997ms downstream_cancel
+      Inventory B                               5,143ms cancelled
+        auth                                         7ms
+        DB pool acquire                             11ms
+        UPDATE stock                              4,742ms
+          db.lock.wait                            4,681ms
+```
+
+A successful warehouse-12 trace has the same connection phases but a 19ms update and no lock child.
+The failed trace identifies request `ord-70c912`, fingerprint `9ac2`, DB host `pg-inventory-2`, and blocker application.
+A narrow B log shows `lock_wait_ms=4681 blocked_by_app=inventory-reconcile job_id=job-901`.
+An approved read-only DB activity view shows job-901 opened a transaction at 08:29:54.
+The batch diff shows version 2.3 changed from commits every 500 rows to one transaction per warehouse.
+This mechanism explains the warehouse scope, flat CPU, healthy transport, and exact timeout shape.
+
+The owner pauses job-901 through its scheduler and lets the transaction finish: mitigation.
+We do not increase timeouts, pools, retries, or replicas because they add blocked work against the same rows.
+The permanent fix restores small commits, consistent row order, a bounded lock timeout, and cancellation propagation.
+A concurrency test runs reservations and reconciliation on the same warehouse.
+At 08:40 lock p99 is 14ms, B p99 151ms, gateway p99 162ms, and timeouts zero.
+At 08:45 business success is 99.97%, attempts/order is 1.00, and every B p99 is below 190ms.
+Reconciliation finds no duplicate or missing reservations; batch 2.3.1 canary has max lock wait 46ms.
+After thirty stable minutes we close with an alert linking business failure, lock fingerprint, and blocker.
+
+> My causal chain was metrics to boundary, trace to child, child to log/query/config, mechanism to targeted fix, then the same technical and business measurements to verification. I did not call one correlated chart a root cause.
