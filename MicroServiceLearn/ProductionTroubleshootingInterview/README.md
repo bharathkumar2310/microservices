@@ -16,7 +16,7 @@ The goal is not to memorize a hundred isolated answers. Most incidents can be so
 
 | Order | Topic | What you will learn |
 |---:|---|---|
-| A | [Service-to-service communication](../../L301_Serv_To_Serv.md) | DNS, TCP, TLS, gateways, 502/503/504, instance-specific failures, and health checks |
+| A | [Service-to-service communication](L301_Serv_To_Serv.md) | DNS, TCP, TLS, gateways, 502/503/504, instance-specific failures, and health checks |
 | B | [API performance and sudden latency](./B_API_Performance.md) | Latency decomposition, percentiles, queueing, endpoint-specific and system-wide slowness |
 | C | [CPU, memory, JVM, and threads](./C_CPU_Memory_JVM.md) | CPU diagnosis, heap/native memory, GC, OOM, thread dumps, deadlocks, and pool exhaustion |
 | D | [Database troubleshooting](./D_Database.md) | Query latency, execution plans, locks, deadlocks, connection pools, N+1, and data-size problems |
